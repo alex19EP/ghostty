@@ -294,8 +294,16 @@ pub const Window = extern struct {
             pub const none: @This() = .{};
         },
     ) *Self {
+        // Pass `accessible-role` as a construct-time property so the AT
+        // context that GTK creates for this instance is seeded with the
+        // correct role. Setting it via `gtk_widget_class_set_accessible_role`
+        // does NOT propagate to the AT context here — we verified the
+        // context still reported `.widget` (mapping to AT-SPI "filler")
+        // which breaks Orca's `frame_and_dialog` lookup and leaves flat
+        // review with no zones to navigate.
         const win = gobject.ext.newInstance(Self, .{
             .application = app,
+            .@"accessible-role" = gtk.AccessibleRole.window,
         });
 
         if (overrides.title) |title| {
@@ -2279,6 +2287,7 @@ pub const Window = extern struct {
             gobject.ext.ensureType(SplitTree);
             gobject.ext.ensureType(Surface);
             gobject.ext.ensureType(Tab);
+
             gtk.Widget.Class.setTemplateFromResource(
                 class.as(gtk.Widget.Class),
                 comptime gresource.blueprint(.{

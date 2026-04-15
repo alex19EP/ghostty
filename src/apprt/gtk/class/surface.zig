@@ -6,6 +6,7 @@ const gdk = @import("gdk");
 const gio = @import("gio");
 const glib = @import("glib");
 const gobject = @import("gobject");
+const graphene = @import("graphene");
 const gtk = @import("gtk");
 
 const apprt = @import("../../../apprt.zig");
@@ -45,7 +46,7 @@ pub const Surface = extern struct {
     const Self = @This();
     parent_instance: Parent,
     pub const Parent = adw.Bin;
-    pub const Implements = [_]type{gtk.Scrollable};
+    pub const Implements = [_]type{ gtk.Scrollable, gtk.AccessibleText };
     pub const getGObjectType = gobject.ext.defineClass(Self, .{
         .name = "GhosttySurface",
         .instanceInit = &init,
@@ -54,6 +55,9 @@ pub const Surface = extern struct {
         .private = .{ .Type = Private, .offset = &Private.offset },
         .implements = &.{
             gobject.ext.implement(gtk.Scrollable, .{}),
+            gobject.ext.implement(gtk.AccessibleText, .{
+                .init = &accessibleTextIfaceInit,
+            }),
         },
     });
 
@@ -694,6 +698,26 @@ pub const Surface = extern struct {
         is_split_binding: ?*gobject.Binding = null,
 
         action_group: ?*gio.SimpleActionGroup = null,
+
+        // Accessibility state for GtkAccessibleText
+        ax_cached_text: ?[:0]const u8 = null,
+        ax_cached_cursor_offset: c_uint = 0,
+        ax_active: bool = false,
+        // Snapshot of the viewport text at the last `updateContents`
+        // notification. We diff against this to emit minimal
+        // insert/remove ranges — firing the whole viewport as inserted
+        // on every keystroke makes Orca's terminal script treat typing
+        // echo as command output and re-read the entire screen.
+        // Owned by `std.heap.c_allocator`.
+        ax_last_snapshot: ?[:0]const u8 = null,
+        // Caret offset at the last `updateCaretPosition` notification.
+        // Same rationale as `ax_last_snapshot`: avoid refiring on every
+        // GL frame (cursor blink, focus change, etc.).
+        ax_last_notified_caret: c_uint = 0,
+        // Millisecond timestamp of the last change check. We rate-limit the
+        // per-frame render callback so we only scan for accessibility changes
+        // a few times per second, not every redraw.
+        ax_last_check_ms: i64 = 0,
 
         // Gtk.Scrollable interface adjustments
         hadj: ?*gtk.Adjustment = null,
@@ -1764,8 +1788,11 @@ pub const Surface = extern struct {
     /// Focus this surface. This properly focuses the input part of
     /// our surface.
     pub fn grabFocus(self: *Self) void {
-        const priv = self.private();
-        _ = priv.gl_area.as(gtk.Widget).grabFocus();
+        // Focus the GhosttySurface itself (not the inner GLArea) so the
+        // focused object exposes role=terminal and GtkAccessibleText to
+        // AT-SPI. The EventControllerKey attached to the template root
+        // receives key events from this focus target.
+        _ = self.as(gtk.Widget).grabFocus();
     }
 
     pub fn sendDesktopNotification(self: *Self, title: [:0]const u8, body: [:0]const u8) void {
@@ -2635,6 +2662,533 @@ pub const Surface = extern struct {
     }
 
     //---------------------------------------------------------------
+    // GtkAccessibleText interface implementation
+
+    fn accessibleTextIfaceInit(iface: *gtk.AccessibleTextInterface) callconv(.c) void {
+        iface.f_get_contents = &axGetContents;
+        iface.f_get_contents_at = &axGetContentsAt;
+        iface.f_get_caret_position = &axGetCaretPosition;
+        iface.f_get_selection = &axGetSelection;
+        iface.f_get_attributes = &axGetAttributes;
+        iface.f_get_default_attributes = &axGetDefaultAttributes;
+        iface.f_get_extents = &axGetExtents;
+        iface.f_get_offset = null;
+    }
+
+    /// Return the pixel extents of a text range within the widget.
+    ///
+    /// Orca's flat review uses this to group TextZones into `Line`s by their Y
+    /// coordinate (`flat_review.py:Line.on_same_line`). If every range returns
+    /// the same rect, all lines collapse into one "line" and flat review can't
+    /// step through them. We compute a per-line rect from the terminal's cell
+    /// dimensions: Y = row_index * cell_height, height = cell_height.
+    fn axGetExtents(
+        self_opaque: *gtk.AccessibleText,
+        start: c_uint,
+        end: c_uint,
+        extents: *graphene.Rect,
+    ) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(self_opaque));
+        const priv = self.private();
+        const core_surface = priv.core_surface orelse return 0;
+
+        const text = self.axRefreshCache() orelse return 0;
+
+        // AT-SPI offsets are codepoint indices. Convert to byte offsets
+        // so the scans below (newlines, column counts) operate on the
+        // actual buffer.
+        const text_cp_count: c_uint = @intCast(utf8CpCount(text));
+        const s_cp = @min(start, text_cp_count);
+        const e_cp = @min(end, text_cp_count);
+        const s_byte = utf8CpToByte(text, s_cp);
+        const e_byte = utf8CpToByte(text, e_cp);
+
+        // Cell metrics from the renderer — same source of truth as the GPU
+        // grid, so our rects match what's on screen.
+        const cell_w: f32 = @floatFromInt(core_surface.size.cell.width);
+        const cell_h: f32 = @floatFromInt(core_surface.size.cell.height);
+        if (cell_w <= 0 or cell_h <= 0) return 0;
+
+        // Row index of `s_byte` within the viewport: count newlines before it.
+        var row: u32 = 0;
+        for (text[0..s_byte]) |ch| {
+            if (ch == '\n') row += 1;
+        }
+
+        // Column index of `s_byte`: scan back to the last newline (or
+        // start) and count codepoints in that prefix — one codepoint per
+        // terminal cell in our dump.
+        var col_start: usize = s_byte;
+        while (col_start > 0 and text[col_start - 1] != '\n') : (col_start -= 1) {}
+        const col: u32 = @intCast(utf8CpCount(text[col_start..s_byte]));
+
+        // Width in cells: codepoints from `s_byte` to the first newline
+        // (or `e_byte`), whichever comes first.
+        var width_cols: u32 = 0;
+        var i_byte: usize = s_byte;
+        while (i_byte < e_byte and text[i_byte] != '\n') {
+            i_byte += utf8CpLen(text[i_byte]);
+            width_cols += 1;
+        }
+        if (width_cols == 0) width_cols = 1;
+
+        extents.f_origin.f_x = @as(f32, @floatFromInt(col)) * cell_w;
+        extents.f_origin.f_y = @as(f32, @floatFromInt(row)) * cell_h;
+        extents.f_size.f_width = @as(f32, @floatFromInt(width_cols)) * cell_w;
+        extents.f_size.f_height = cell_h;
+        return 1;
+    }
+
+    /// Refresh the cached accessibility text from the terminal viewport.
+    /// Returns the cached text. Uses a 500ms cache to avoid locking the
+    /// renderer too frequently.
+    ///
+    /// The text is built one visual row per `\n`-delimited line so every
+    /// viewport row — including blank rows and the prompt row currently
+    /// waiting for input — has a byte range Orca's flat review can point at.
+    /// Going through `dumpTextLocked` would use `unwrap=true` and discard
+    /// trailing blank rows, leaving the bottom of the viewport invisible to
+    /// the AT client and misaligning `axGetExtents` (which derives Y from
+    /// `\n` count).
+    fn axRefreshCache(self: *Self) ?[:0]const u8 {
+        const priv = self.private();
+
+        // Mark that an AT client is actively querying us.
+        priv.ax_active = true;
+
+        // Serve the existing cache if it's populated. The cache is rebuilt
+        // and re-published on every render frame via `axNotifyIfChanged`,
+        // so this path only does the initial build. Using a time-based TTL
+        // here would let the cache refresh mid-read (e.g. between
+        // `get_character_count` and `iter_line` during an Orca flat review
+        // pass), silently shifting offsets under the client and causing
+        // lines past the first "short" snapshot length to disappear.
+        if (priv.ax_cached_text != null) return priv.ax_cached_text;
+
+        const core_surface = priv.core_surface orelse return null;
+
+        // Lock the renderer state and read the viewport text.
+        core_surface.renderer_state.mutex.lock();
+        defer core_surface.renderer_state.mutex.unlock();
+
+        const t: *terminal.Terminal = core_surface.renderer_state.terminal;
+        const screen: *terminal.Screen = t.screens.active;
+        const pages = &screen.pages;
+        const viewport_rows: usize = pages.rows;
+
+        const alloc = std.heap.c_allocator;
+
+        // Free old cached text.
+        if (priv.ax_cached_text) |old| {
+            alloc.free(old);
+            priv.ax_cached_text = null;
+        }
+
+        var buffer: std.ArrayList(u8) = .empty;
+        defer buffer.deinit(alloc);
+
+        const cursor = screen.cursor;
+        var cursor_offset: ?c_uint = null;
+
+        const tl_pin = pages.getTopLeft(.viewport);
+        var row_it = tl_pin.rowIterator(.right_down, null);
+        var row_idx: usize = 0;
+        while (row_idx < viewport_rows) : (row_idx += 1) {
+            if (row_idx > 0) buffer.append(alloc, '\n') catch return null;
+
+            const pin = row_it.next() orelse continue;
+            const is_cursor_row = row_idx == cursor.y;
+            const row_start: c_uint = @intCast(buffer.items.len);
+            if (is_cursor_row) cursor_offset = row_start;
+
+            const cells = pin.cells(.all);
+
+            // Accumulate empty cells so runs of trailing empties drop off the
+            // end of the row, but intermediate gaps still get emitted as
+            // spaces to preserve column positions. This matches what
+            // `ScreenFormatter` does for non-trailing blanks.
+            var blank_cells: usize = 0;
+            for (0..cells.len) |col| {
+                // Record cursor byte position before writing the cell at
+                // cursor.x, so the offset points AT that cell.
+                if (is_cursor_row and col == cursor.x) {
+                    cursor_offset = @intCast(buffer.items.len);
+                }
+
+                const cell = &cells[col];
+                switch (cell.wide) {
+                    .spacer_tail, .spacer_head => continue,
+                    .narrow, .wide => {},
+                }
+
+                if (!cell.hasText()) {
+                    blank_cells += 1;
+                    continue;
+                }
+
+                buffer.appendNTimes(alloc, ' ', blank_cells) catch return null;
+                blank_cells = 0;
+
+                var ubuf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(cell.codepoint(), &ubuf) catch {
+                    buffer.append(alloc, '?') catch return null;
+                    continue;
+                };
+                buffer.appendSlice(alloc, ubuf[0..n]) catch return null;
+
+                if (cell.hasGrapheme()) {
+                    if (pin.grapheme(cell)) |graphemes| {
+                        for (graphemes) |cp| {
+                            const gn = std.unicode.utf8Encode(cp, &ubuf) catch continue;
+                            buffer.appendSlice(alloc, ubuf[0..gn]) catch return null;
+                        }
+                    }
+                }
+            }
+
+            // If cursor.x is past the last column we emitted (trailing
+            // blanks, or cursor beyond row end), anchor to end-of-row.
+            if (is_cursor_row and cursor.x >= cells.len) {
+                cursor_offset = @intCast(buffer.items.len);
+            }
+        }
+
+        const text = alloc.dupeZ(u8, buffer.items) catch return null;
+        priv.ax_cached_text = text;
+
+        // Caret offset exposed to AT-SPI is in UTF-8 codepoint units; our
+        // `cursor_offset` is a byte position in `text`. Convert it before
+        // caching. If the cursor row isn't in the viewport, anchor at end.
+        const cursor_byte = cursor_offset orelse @as(c_uint, @intCast(text.len));
+        const cursor_byte_clamped: usize = @min(@as(usize, cursor_byte), text.len);
+        priv.ax_cached_cursor_offset = @intCast(utf8CpCount(text[0..cursor_byte_clamped]));
+
+        return priv.ax_cached_text;
+    }
+
+    /// Check whether the terminal text or caret has changed since the last
+    /// AT-SPI notification and, if so, emit the corresponding change signals.
+    ///
+    /// This is the linchpin for Orca (and any other AT-SPI client) to work
+    /// with Ghostty. The GL area renders on every frame — cursor blinks,
+    /// focus changes, scroll — and if we fired `updateContents` unconditionally
+    /// the AT client would spin in a read-interrupt-read loop and never finish
+    /// announcing anything.
+    ///
+    /// Strategy: keep a snapshot of the last-notified viewport text and diff
+    /// against it. Collapse the change to a common-prefix / common-suffix
+    /// range and emit a targeted `remove` + `insert` pair. Orca's terminal
+    /// script classifies events by the length of `any_data`, so a single-
+    /// character insert reads as typing echo rather than command output.
+    fn axNotifyIfChanged(self: *Self) void {
+        const priv = self.private();
+
+        // Drop the existing cache so axRefreshCache rebuilds from the live
+        // viewport. The cache is the sole source of truth for AT clients
+        // reading us, so rebuilding here also re-publishes the new state.
+        if (priv.ax_cached_text) |old| {
+            std.heap.c_allocator.free(old);
+            priv.ax_cached_text = null;
+        }
+        const new_text = self.axRefreshCache() orelse return;
+        const old_text: []const u8 = priv.ax_last_snapshot orelse "";
+
+        // Common prefix (byte-wise).
+        var p: usize = 0;
+        const min_len = @min(old_text.len, new_text.len);
+        while (p < min_len and old_text[p] == new_text[p]) : (p += 1) {}
+
+        // Common suffix, bounded so it can't overlap the prefix on either
+        // side (otherwise the remove/insert ranges would go negative).
+        var s: usize = 0;
+        const max_s = @min(old_text.len - p, new_text.len - p);
+        while (s < max_s and
+            old_text[old_text.len - 1 - s] == new_text[new_text.len - 1 - s]) : (s += 1)
+        {}
+
+        // `p` and `old_text.len - s` must land on UTF-8 codepoint
+        // boundaries — otherwise the remove/insert substring we hand to
+        // GTK's AT-SPI bridge contains orphan continuation bytes, and
+        // `g_variant_new_string` returns NULL, making `g_variant_new`
+        // SIGSEGV inside `g_variant_builder_add_value`. Two multi-byte
+        // codepoints that share a leading byte (e.g. `│` and `├`, both
+        // starting with 0xE2 0x94) will let the byte-wise prefix walk
+        // into the middle of a character. The `p < old_text.len` guard
+        // matters when `old` is a prefix of `new` (common when only the
+        // caret moved): then `p == old_text.len` and indexing would go
+        // out of bounds — but end-of-buffer is already a codepoint
+        // boundary, so no alignment is needed.
+        while (p > 0 and p < old_text.len and (old_text[p] & 0xC0) == 0x80) : (p -= 1) {}
+        while (s > 0 and (old_text[old_text.len - s] & 0xC0) == 0x80) : (s -= 1) {}
+
+        const removed_len = old_text.len - p - s;
+        const inserted_len = new_text.len - p - s;
+        const text_changed = removed_len != 0 or inserted_len != 0;
+        const caret_changed = priv.ax_cached_cursor_offset != priv.ax_last_notified_caret;
+
+        if (!text_changed and !caret_changed) return;
+
+        const ax_self: *gtk.AccessibleText = @ptrCast(self);
+        if (text_changed) {
+            // AT-SPI positions are in UTF-8 codepoint units, not bytes.
+            const start_cp: c_uint = @intCast(utf8CpCount(old_text[0..p]));
+            if (removed_len != 0) {
+                // GTK's AT-SPI bridge fills `any_data` by calling back into
+                // `axGetContents(start, end)` synchronously during the
+                // updateContents call. For a remove event, the AT client
+                // expects the *deleted* substring — but our cache already
+                // holds the post-deletion text. Swap in the old snapshot
+                // so the bridge sees the deleted range. The cache timestamp
+                // stays fresh from the refresh above, so axRefreshCache
+                // will return our swapped pointer rather than re-reading.
+                const saved_cache = priv.ax_cached_text;
+                const saved_cursor = priv.ax_cached_cursor_offset;
+                priv.ax_cached_text = priv.ax_last_snapshot;
+                priv.ax_cached_cursor_offset = priv.ax_last_notified_caret;
+                const end_cp: c_uint = @intCast(utf8CpCount(old_text[0..(old_text.len - s)]));
+                gtk.AccessibleText.updateContents(ax_self, .remove, start_cp, end_cp);
+                priv.ax_cached_text = saved_cache;
+                priv.ax_cached_cursor_offset = saved_cursor;
+            }
+            if (inserted_len != 0) {
+                const end_cp: c_uint = @intCast(utf8CpCount(new_text[0..(new_text.len - s)]));
+                gtk.AccessibleText.updateContents(ax_self, .insert, start_cp, end_cp);
+            }
+
+            // Replace the snapshot. We own a copy via c_allocator rather
+            // than aliasing `ax_cached_text` because the cache is freed
+            // and rewritten on every refresh.
+            const alloc = std.heap.c_allocator;
+            if (priv.ax_last_snapshot) |prev| alloc.free(prev);
+            priv.ax_last_snapshot = alloc.dupeZ(u8, new_text) catch null;
+        }
+        if (caret_changed) {
+            priv.ax_last_notified_caret = priv.ax_cached_cursor_offset;
+            gtk.AccessibleText.updateCaretPosition(ax_self);
+        }
+    }
+
+    fn axGetContents(
+        self_opaque: *gtk.AccessibleText,
+        start: c_uint,
+        end: c_uint,
+    ) callconv(.c) *glib.Bytes {
+        const self: *Self = @ptrCast(@alignCast(self_opaque));
+        const text = self.axRefreshCache() orelse return axEmptyBytes();
+
+        // `start`/`end` are UTF-8 codepoint indices per the AT-SPI Text
+        // contract. Convert to byte offsets before slicing so the returned
+        // bytes are always valid UTF-8.
+        const byte_start = utf8CpToByte(text, @intCast(start));
+        const byte_end = utf8CpToByte(text, @intCast(end));
+        if (byte_start >= byte_end) return axEmptyBytes();
+
+        return axBytesNulTerm(text[byte_start..byte_end]);
+    }
+
+    /// Returns a NUL-terminated empty `GBytes` so downstream code that
+    /// treats the payload as a C string (e.g. GTK's AT-SPI bridge calling
+    /// `g_variant_new_string` on the result) has something safe to read.
+    ///
+    /// Using a string literal gives us a pointer into static read-only
+    /// storage; `&[_:0]u8{}` looks equivalent but its address is only
+    /// valid for the enclosing scope, and `g_bytes_new` (which copies
+    /// its input) can observe the dangling/poisoned memory and SIGSEGV.
+    fn axEmptyBytes() *glib.Bytes {
+        return glib.Bytes.new("", 1);
+    }
+
+    /// Wrap `slice` in a freshly-allocated, NUL-terminated `GBytes`.
+    ///
+    /// GTK's `gtk_at_spi_context_update_text_contents` fetches the pointer
+    /// via `g_bytes_get_data(bytes, NULL)` and passes it straight to
+    /// `g_variant_new_string`, which expects a NUL-terminated C string. The
+    /// docs for `GtkAccessibleText.get_contents` say NUL termination isn't
+    /// required, but that code path assumes it; with no terminator the
+    /// variant builder walks past the GBytes allocation and eventually
+    /// SIGSEGVs inside `g_variant_builder_add_value`.
+    ///
+    /// Bytes that fail UTF-8 validation are replaced with an empty result:
+    /// `gtkatspitext.c`'s `GetText`/`GetStringAtOffset` wrap our payload
+    /// via `g_variant_new("(s)", ...)`, and glib's "s" format substitutes
+    /// the literal string "[Invalid UTF-8]" when validation fails — which
+    /// Orca then speaks aloud. We slice on codepoint boundaries, so hitting
+    /// this path means our buffer itself has broken UTF-8; log the offset
+    /// and surrounding bytes so we can track down the source.
+    fn axBytesNulTerm(slice: []const u8) *glib.Bytes {
+        if (std.unicode.utf8ValidateSlice(slice)) {
+            const c_alloc = std.heap.c_allocator;
+            const buf = c_alloc.alloc(u8, slice.len + 1) catch return axEmptyBytes();
+            defer c_alloc.free(buf);
+            @memcpy(buf[0..slice.len], slice);
+            buf[slice.len] = 0;
+            // g_bytes_new copies, so `buf` can be freed when this returns.
+            return glib.Bytes.new(buf.ptr, slice.len + 1);
+        }
+
+        // Walk the slice to find the first invalid byte and log context
+        // around it (16 bytes each side, hex) so the source is identifiable.
+        var bad: usize = 0;
+        while (bad < slice.len) {
+            const len = utf8CpLen(slice[bad]);
+            if (bad + len > slice.len) break;
+            if (!std.unicode.utf8ValidateSlice(slice[bad..][0..len])) break;
+            bad += len;
+        }
+        const ctx_start = bad -| 16;
+        const ctx_end = @min(slice.len, bad + 16);
+        var hex_buf: [64 * 3]u8 = undefined;
+        var hex_len: usize = 0;
+        for (slice[ctx_start..ctx_end]) |b| {
+            const written = std.fmt.bufPrint(hex_buf[hex_len..], "{x:0>2} ", .{b}) catch break;
+            hex_len += written.len;
+        }
+        log.warn(
+            "accessibility: invalid UTF-8 at byte {d} of {d}; context [{s}]",
+            .{ bad, slice.len, hex_buf[0..hex_len] },
+        );
+        return axEmptyBytes();
+    }
+
+    /// Byte length of a UTF-8 codepoint given its leading byte. Malformed
+    /// continuation or overlong starts advance 1 byte so the scan always
+    /// makes forward progress.
+    fn utf8CpLen(b: u8) usize {
+        if (b < 0x80) return 1;
+        if (b < 0xC0) return 1;
+        if (b < 0xE0) return 2;
+        if (b < 0xF0) return 3;
+        return 4;
+    }
+
+    /// Count UTF-8 codepoints in `s`.
+    fn utf8CpCount(s: []const u8) usize {
+        var i: usize = 0;
+        var n: usize = 0;
+        while (i < s.len) : (n += 1) i += utf8CpLen(s[i]);
+        return n;
+    }
+
+    /// Byte offset of the `cp_idx`-th codepoint in `s`. Clamps at `s.len`.
+    fn utf8CpToByte(s: []const u8, cp_idx: usize) usize {
+        var i: usize = 0;
+        var c: usize = 0;
+        while (i < s.len and c < cp_idx) : (c += 1) i += utf8CpLen(s[i]);
+        return i;
+    }
+
+    fn axGetContentsAt(
+        self_opaque: *gtk.AccessibleText,
+        offset: c_uint,
+        granularity: gtk.AccessibleTextGranularity,
+        out_start: *c_uint,
+        out_end: *c_uint,
+    ) callconv(.c) *glib.Bytes {
+        const self: *Self = @ptrCast(@alignCast(self_opaque));
+        const text = self.axRefreshCache() orelse {
+            out_start.* = 0;
+            out_end.* = 0;
+            return axEmptyBytes();
+        };
+
+        // `offset` arrives from GTK as a codepoint index. All boundary
+        // scanning runs on bytes (fast, simple), and we convert back to
+        // codepoint indices before handing anything back to the caller.
+        const text_cp_count: c_uint = @intCast(utf8CpCount(text));
+        const off_cp = @min(offset, text_cp_count);
+        const off_byte = utf8CpToByte(text, off_cp);
+
+        switch (granularity) {
+            .character => {
+                if (off_cp >= text_cp_count) {
+                    out_start.* = text_cp_count;
+                    out_end.* = text_cp_count;
+                    return axEmptyBytes();
+                }
+                const end_byte = off_byte + utf8CpLen(text[off_byte]);
+                out_start.* = off_cp;
+                out_end.* = off_cp + 1;
+                return axBytesNulTerm(text[off_byte..end_byte]);
+            },
+            .word => {
+                var ws_byte: usize = off_byte;
+                while (ws_byte > 0 and text[ws_byte - 1] != ' ' and text[ws_byte - 1] != '\n') : (ws_byte -= 1) {}
+                var we_byte: usize = off_byte;
+                while (we_byte < text.len and text[we_byte] != ' ' and text[we_byte] != '\n') : (we_byte += 1) {}
+                out_start.* = @intCast(utf8CpCount(text[0..ws_byte]));
+                out_end.* = @intCast(utf8CpCount(text[0..we_byte]));
+                return axBytesNulTerm(text[ws_byte..we_byte]);
+            },
+            .line, .paragraph, .sentence => {
+                var ls_byte: usize = off_byte;
+                while (ls_byte > 0 and text[ls_byte - 1] != '\n') : (ls_byte -= 1) {}
+                var le_byte: usize = off_byte;
+                while (le_byte < text.len and text[le_byte] != '\n') : (le_byte += 1) {}
+                if (le_byte < text.len) le_byte += 1; // include the newline
+                out_start.* = @intCast(utf8CpCount(text[0..ls_byte]));
+                out_end.* = @intCast(utf8CpCount(text[0..le_byte]));
+                return axBytesNulTerm(text[ls_byte..le_byte]);
+            },
+            _ => {
+                out_start.* = off_cp;
+                out_end.* = off_cp;
+                return axEmptyBytes();
+            },
+        }
+    }
+
+    fn axGetCaretPosition(
+        self_opaque: *gtk.AccessibleText,
+    ) callconv(.c) c_uint {
+        const self: *Self = @ptrCast(@alignCast(self_opaque));
+        _ = self.axRefreshCache();
+        return self.private().ax_cached_cursor_offset;
+    }
+
+    fn axGetSelection(
+        self_opaque: *gtk.AccessibleText,
+        n_ranges: *usize,
+        _: ?*[*]gtk.AccessibleTextRange,
+    ) callconv(.c) c_int {
+        _ = self_opaque;
+        n_ranges.* = 0;
+        return 0; // FALSE = no selection
+    }
+
+    fn axGetAttributes(
+        self_opaque: *gtk.AccessibleText,
+        offset: c_uint,
+        n_ranges: *usize,
+        _: ?*[*]gtk.AccessibleTextRange,
+        _: ?*[*][*:0]u8,
+        _: ?*[*][*:0]u8,
+    ) callconv(.c) c_int {
+        _ = self_opaque;
+        _ = offset;
+        n_ranges.* = 0;
+        return 0; // FALSE = no attributes
+    }
+
+    fn axGetDefaultAttributes(
+        self_opaque: *gtk.AccessibleText,
+        attribute_names: ?*[*][*:0]u8,
+        attribute_values: ?*[*][*:0]u8,
+    ) callconv(.c) void {
+        _ = self_opaque;
+        // GTK expects NULL-terminated arrays (transfer full).
+        // Allocate minimal arrays with just the NULL terminator
+        // using g_malloc0 so GTK can g_strfreev them.
+        if (attribute_names) |n| {
+            const ptr = glib.malloc0(@sizeOf(?[*:0]u8));
+            n.* = @ptrCast(@alignCast(ptr));
+        }
+        if (attribute_values) |v| {
+            const ptr = glib.malloc0(@sizeOf(?[*:0]u8));
+            v.* = @ptrCast(@alignCast(ptr));
+        }
+    }
+
+    //---------------------------------------------------------------
     // Signal Handlers
 
     pub fn actionPromptTitle(
@@ -2863,11 +3417,12 @@ pub const Surface = extern struct {
         const priv = self.private();
         const core_surface = priv.core_surface orelse return;
 
-        // If we don't have focus, grab it.
-        const gl_area_widget = priv.gl_area.as(gtk.Widget);
-        const had_focus = gl_area_widget.hasFocus() != 0;
+        // If we don't have focus, grab it. Focus is tracked on the
+        // GhosttySurface itself (see `grabFocus`), not the GLArea.
+        const widget = self.as(gtk.Widget);
+        const had_focus = widget.hasFocus() != 0;
         if (!had_focus) {
-            _ = gl_area_widget.grabFocus();
+            _ = widget.grabFocus();
         }
 
         // Report the event
@@ -3000,13 +3555,14 @@ pub const Surface = extern struct {
             @abs(priv.cursor_pos.y - pos.y) < 1;
         if (is_cursor_still) return;
 
-        // If we don't have focus, and we want it, grab it.
+        // If we don't have focus, and we want it, grab it. Focus lives
+        // on the GhosttySurface itself, not the inner GLArea.
         if (priv.config) |config| {
-            const gl_area_widget = priv.gl_area.as(gtk.Widget);
-            if (gl_area_widget.hasFocus() == 0 and
+            const widget = self.as(gtk.Widget);
+            if (widget.hasFocus() == 0 and
                 config.get().@"focus-follows-mouse")
             {
-                _ = gl_area_widget.grabFocus();
+                _ = widget.grabFocus();
             }
         }
 
@@ -3440,6 +3996,12 @@ pub const Surface = extern struct {
             return 0;
         };
 
+        // If an AT client is actively querying, check whether the terminal
+        // text actually changed since the last notification. We only emit the
+        // AT-SPI change events when something actually changed, so we don't
+        // interrupt Orca (or any other AT client) mid-read on every GL frame.
+        if (priv.ax_active) self.axNotifyIfChanged();
+
         return 1;
     }
 
@@ -3511,6 +4073,7 @@ pub const Surface = extern struct {
     fn initSurface(self: *Self) InitError!void {
         const priv: *Private = self.private();
         assert(priv.core_surface == null);
+
         const gl_area = priv.gl_area;
 
         // We need to make the context current so we can call GL functions.
@@ -3656,7 +4219,7 @@ pub const Surface = extern struct {
         _ = surface.performBindingAction(.end_search) catch |err| {
             log.warn("unable to perform end_search action err={}", .{err});
         };
-        _ = self.private().gl_area.as(gtk.Widget).grabFocus();
+        _ = self.as(gtk.Widget).grabFocus();
     }
 
     fn searchChanged(_: *SearchOverlay, needle: ?[*:0]const u8, self: *Self) callconv(.c) void {
@@ -3869,6 +4432,12 @@ pub const Surface = extern struct {
             gobject.ext.ensureType(SearchOverlay);
             gobject.ext.ensureType(KeyStateOverlay);
             gobject.ext.ensureType(ChildExited);
+
+            // Set the accessible role to terminal so screen readers
+            // like Orca know how to handle this widget. This matches
+            // GTK_ACCESSIBLE_ROLE_TERMINAL added in GTK 4.14.
+            gtk.WidgetClass.setAccessibleRole(class.as(gtk.Widget.Class), .terminal);
+
             gtk.Widget.Class.setTemplateFromResource(
                 class.as(gtk.Widget.Class),
                 comptime gresource.blueprint(.{
