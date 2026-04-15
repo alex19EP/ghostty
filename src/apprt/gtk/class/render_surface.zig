@@ -78,6 +78,22 @@ pub const RenderSurface = extern struct {
                 void,
             );
         };
+
+        /// Emitted when a newly rendered frame has been taken from the
+        /// renderer's queue, i.e. once per frame that actually reaches the
+        /// screen. A plain redraw that finds no new frame does not emit.
+        ///
+        /// This is the hook the accessibility layer uses to diff the
+        /// terminal text; see `axNotifyIfChanged` in `surface.zig`.
+        pub const present = struct {
+            pub const name = "present";
+            const impl = gobject.ext.defineSignal(
+                name,
+                Self,
+                &.{},
+                void,
+            );
+        };
     };
 
     //---------------------------------------------------------------
@@ -147,6 +163,10 @@ pub const RenderSurface = extern struct {
                 self.rebuildTexture(frame) catch |err| {
                     log.warn("error building texture from frame err={}", .{err});
                 };
+
+                // Let the apprt surface know a new frame reached the
+                // screen, so it can diff the terminal text for AT clients.
+                signals.present.impl.emit(self, null, .{}, null);
             }
         }
 
@@ -336,6 +356,7 @@ pub const RenderSurface = extern struct {
 
             // Signals
             signals.resize.impl.register(.{});
+            signals.present.impl.register(.{});
         }
 
         pub const as = C.Class.as;

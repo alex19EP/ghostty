@@ -391,6 +391,12 @@ pub const Application = extern struct {
         );
         errdefer css_provider.unref();
 
+        // Set the application name so screen readers and window managers
+        // identify the app as "Ghostty" rather than the process name. AT-SPI
+        // otherwise reports the application as "Unnamed", and Orca can't
+        // locate it by name (see `ax_utilities_application.py`).
+        glib.setApplicationName("Ghostty");
+
         // Initialize the app.
         const self = gobject.ext.newInstance(Self, .{
             .application_id = app_id.ptr,
@@ -3189,6 +3195,9 @@ const Action = struct {
         const win = gobject.ext.newInstance(Window, .{
             .application = self,
             .@"quick-terminal" = true,
+            // Seed the accessible role so the ATContext exposes us as a
+            // proper frame to AT-SPI. See Window.new for details.
+            .@"accessible-role" = gtk.AccessibleRole.window,
         });
         assert(win.isQuickTerminal());
         initAndShowWindow(self, win, null, .none);
