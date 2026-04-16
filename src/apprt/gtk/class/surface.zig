@@ -18,11 +18,14 @@ const input = @import("../../../input.zig");
 const internal_os = @import("../../../os/main.zig");
 const renderer = @import("../../../renderer.zig");
 const terminal = @import("../../../terminal/main.zig");
+const terminal_hyperlink = @import("../../../terminal/hyperlink.zig");
 const CoreSurface = @import("../../../Surface.zig");
 const gresource = @import("../build/gresource.zig");
+const a11y_hypertext = @import("../a11y_hypertext.zig");
 const ext = @import("../ext.zig");
 const gsettings = @import("../gsettings.zig");
 const gtk_key = @import("../key.zig");
+const gtk_version = @import("../gtk_version.zig");
 const ApprtSurface = @import("../Surface.zig");
 const Common = @import("../class.zig").Common;
 const Application = @import("application.zig").Application;
@@ -38,7 +41,6 @@ const InspectorWindow = @import("inspector_window.zig").InspectorWindow;
 const SplitTree = @import("split_tree.zig").SplitTree;
 const i18n = @import("../../../os/i18n.zig");
 const global = @import("../../../global.zig");
-const gtk_version = @import("../gtk_version.zig");
 
 const log = std.log.scoped(.gtk_ghostty_surface);
 
@@ -46,7 +48,12 @@ pub const Surface = extern struct {
     const Self = @This();
     parent_instance: Parent,
     pub const Parent = adw.Bin;
-    pub const Implements = [_]type{ gtk.Scrollable, gtk.AccessibleText };
+    pub const Implements = [_]type{
+        gtk.Scrollable,
+        gtk.Accessible,
+        gtk.AccessibleText,
+        a11y_hypertext.AccessibleHypertext,
+    };
     pub const getGObjectType = gobject.ext.defineClass(Self, .{
         .name = "GhosttySurface",
         .instanceInit = &init,
@@ -55,8 +62,27 @@ pub const Surface = extern struct {
         .private = .{ .Type = Private, .offset = &Private.offset },
         .implements = &.{
             gobject.ext.implement(gtk.Scrollable, .{}),
+            // Re-implement GtkAccessible (already provided by GtkWidget
+            // ancestry) so we can override `get_first_accessible_child`
+            // to expose OSC 8 hyperlink accessibles. Without this,
+            // Hypertext's `get_link` is reachable via D-Bus but the
+            // hyperlink objects never enter Orca's tree walk, so flat
+            // review and line reading never visit them. The iface_init
+            // receives the parent's already-populated vtable and only
+            // overrides the one child-walk hook we care about.
+            gobject.ext.implement(gtk.Accessible, .{
+                .init = &accessibleIfaceInit,
+            }),
             gobject.ext.implement(gtk.AccessibleText, .{
                 .init = &accessibleTextIfaceInit,
+            }),
+            // GtkAccessibleHypertext is GTK 4.22+. We resolve its GType
+            // lazily via dlsym (see `a11y_hypertext.init`), so on older
+            // GTK `getGObjectType()` returns 0 and GObject simply
+            // declines to add the interface — graceful degrade to
+            // no link announcement.
+            gobject.ext.implement(a11y_hypertext.AccessibleHypertext, .{
+                .init = &accessibleHypertextIfaceInit,
             }),
         },
     });
@@ -714,10 +740,28 @@ pub const Surface = extern struct {
         // Same rationale as `ax_last_snapshot`: avoid refiring on every
         // GL frame (cursor blink, focus change, etc.).
         ax_last_notified_caret: c_uint = 0,
+        // Whether the terminal had an active selection at the last
+        // `updateSelectionBound` notification. Compared per frame in
+        // `axNotifyIfChanged` so Orca hears "selected" / "unselected"
+        // transitions without polling.
+        ax_last_had_selection: bool = false,
+        ax_last_selection_start: c_uint = 0,
+        ax_last_selection_end: c_uint = 0,
         // Millisecond timestamp of the last change check. We rate-limit the
         // per-frame render callback so we only scan for accessibility changes
         // a few times per second, not every redraw.
         ax_last_check_ms: i64 = 0,
+        // OSC 8 hyperlink ranges discovered in the current viewport,
+        // rebuilt alongside `ax_cached_text`. Only populated when
+        // `a11y_hypertext.available` is true (GTK >= 4.22). Each entry
+        // owns a dup'd NUL-terminated URI and a strong ref on its
+        // GtkAccessibleHyperlink object.
+        ax_links: std.ArrayList(AxLink) = .empty,
+        // Coalesced per-cell style runs describing which codepoint
+        // ranges carry which `terminal.Style`. Parallel to
+        // `ax_cached_text`; rebuilt in `axRefreshCache`. Gaps between
+        // runs are implicitly the default style.
+        ax_style_runs: std.ArrayList(StyleRun) = .empty,
 
         // Gtk.Scrollable interface adjustments
         hadj: ?*gtk.Adjustment = null,
@@ -765,6 +809,31 @@ pub const Surface = extern struct {
 
             pub const none: @This() = .{};
         } = .none,
+
+        pub const AxLink = struct {
+            /// Start offset in UTF-8 codepoints (AT-SPI convention;
+            /// see gotcha #7 in CLAUDE.md).
+            start_cp: c_uint,
+            /// Exclusive end offset in codepoints.
+            end_cp: c_uint,
+            /// Owned, allocated via `std.heap.c_allocator` so the URI
+            /// survives page-memory shifts between refreshes.
+            uri: [:0]u8,
+            /// Strong reference; must be unref'd on rebuild / dispose.
+            obj: *a11y_hypertext.AccessibleHyperlink,
+        };
+
+        /// A maximal run of consecutive codepoints sharing identical
+        /// non-default terminal style. Runs are half-open `[start_cp,
+        /// end_cp)` in codepoint units (gotcha #7); gaps between runs
+        /// are implicitly default-styled (inter-row `\n`, blank cells
+        /// emitted as spaces). Built once per cache refresh alongside
+        /// `ax_cached_text` and consumed by `axGetAttributes`.
+        pub const StyleRun = struct {
+            start_cp: c_uint,
+            end_cp: c_uint,
+            style: terminal.Style,
+        };
 
         pub var offset: c_int = 0;
     };
@@ -2044,6 +2113,14 @@ pub const Surface = extern struct {
         for (priv.key_tables.items) |s| alloc.free(s);
         priv.key_tables.deinit(alloc);
 
+        // Release any GtkAccessibleHyperlink objects and owned URIs.
+        // `ax_links` uses `std.heap.c_allocator` separately from
+        // `alloc` above so URIs survive across refreshes even while
+        // page memory moves.
+        self.clearAxLinks();
+        priv.ax_links.deinit(std.heap.c_allocator);
+        priv.ax_style_runs.deinit(std.heap.c_allocator);
+
         gobject.Object.virtual_methods.finalize.call(
             Class.parent,
             self.as(Parent),
@@ -2662,7 +2739,59 @@ pub const Surface = extern struct {
     }
 
     //---------------------------------------------------------------
+    // GtkAccessible interface override
+    //
+    // Overrides `get_first_accessible_child` to return null, so the
+    // Surface presents as a single text-bearing leaf accessible to
+    // Orca. GTK's default walks `gtk_widget_get_first_child` which
+    // would expose the GLArea and template descendants — clutter
+    // for object nav and flat review that has no semantic value
+    // for the user. Links are announced inline by Orca's
+    // `_adjust_for_links` which reads our `GtkAccessibleHypertext`
+    // interface directly; no link-role children are needed for
+    // inline announcement (see CLAUDE.md gotcha #12).
+
+    fn accessibleIfaceInit(iface: *gtk.AccessibleInterface) callconv(.c) void {
+        iface.f_get_first_accessible_child = &axGetFirstAccessibleChild;
+    }
+
+    /// Return no accessible children. GTK's default walks the widget
+    /// tree (GLArea, template descendants) and exposes them to AT-SPI,
+    /// which clutters Orca's object navigation and flat review with
+    /// implementation-detail objects. The Surface presents as a single
+    /// text-bearing accessible; links are announced inline via the
+    /// Hypertext interface (`_adjust_for_links` in Orca reads them
+    /// directly, without needing link-role children).
+    fn axGetFirstAccessibleChild(
+        _: *gtk.Accessible,
+    ) callconv(.c) ?*gtk.Accessible {
+        return null;
+    }
+
+    //---------------------------------------------------------------
     // GtkAccessibleText interface implementation
+
+    /// Extension of zig-gobject 0.3.0's `gtk.AccessibleTextInterface`
+    /// that exposes the GTK 4.22 trailing slots (`set_caret_position` and
+    /// `set_selection`). Our pinned bindings stop at `f_get_offset`
+    /// (GTK 4.16), but at runtime `G_DEFINE_INTERFACE` allocates the
+    /// vtable at GTK's own `sizeof(GtkAccessibleTextInterface)` — so on
+    /// a GTK 4.22+ runtime the trailing slots exist in memory and can be
+    /// written via a wider view. Same runtime-resolution philosophy as
+    /// `a11y_hypertext.zig` (CLAUDE.md gotcha #9): assign only when the
+    /// runtime version supports it, and degrade gracefully otherwise.
+    const AccessibleTextInterfaceExt = extern struct {
+        base: gtk.AccessibleTextInterface,
+        f_set_caret_position: ?*const fn (
+            *gtk.AccessibleText,
+            c_uint,
+        ) callconv(.c) c_int,
+        f_set_selection: ?*const fn (
+            *gtk.AccessibleText,
+            usize,
+            *gtk.AccessibleTextRange,
+        ) callconv(.c) c_int,
+    };
 
     fn accessibleTextIfaceInit(iface: *gtk.AccessibleTextInterface) callconv(.c) void {
         iface.f_get_contents = &axGetContents;
@@ -2672,7 +2801,16 @@ pub const Surface = extern struct {
         iface.f_get_attributes = &axGetAttributes;
         iface.f_get_default_attributes = &axGetDefaultAttributes;
         iface.f_get_extents = &axGetExtents;
-        iface.f_get_offset = null;
+        iface.f_get_offset = &axGetOffset;
+
+        // GTK 4.22+ trailing slots. Guarded on the runtime version —
+        // on older GTK the slots aren't part of the allocated vtable
+        // and writing to them would scribble past it.
+        if (gtk_version.runtimeAtLeast(4, 22, 0)) {
+            const ext_iface: *AccessibleTextInterfaceExt = @ptrCast(iface);
+            ext_iface.f_set_caret_position = &axSetCaretPosition;
+            ext_iface.f_set_selection = &axSetSelection;
+        }
     }
 
     /// Return the pixel extents of a text range within the widget.
@@ -2739,6 +2877,91 @@ pub const Surface = extern struct {
         return 1;
     }
 
+    /// Map a widget-space point to a codepoint offset within the cached
+    /// text. Inverse of `axGetExtents`.
+    ///
+    /// Offsets are codepoint indices (CLAUDE.md gotcha #7). Negative or
+    /// non-finite inputs clamp to (0, 0); points past the end clamp to
+    /// the last cell of the last row so the AT client always gets an
+    /// in-range offset when we return TRUE.
+    fn axGetOffset(
+        self_opaque: *gtk.AccessibleText,
+        point: *const graphene.Point,
+        out_offset: *c_uint,
+    ) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(self_opaque));
+        const priv = self.private();
+        const core_surface = priv.core_surface orelse {
+            out_offset.* = 0;
+            return 0;
+        };
+
+        const text = self.axRefreshCache() orelse {
+            out_offset.* = 0;
+            return 0;
+        };
+
+        const cell_w: f32 = @floatFromInt(core_surface.size.cell.width);
+        const cell_h: f32 = @floatFromInt(core_surface.size.cell.height);
+        if (cell_w <= 0 or cell_h <= 0) {
+            out_offset.* = 0;
+            return 0;
+        }
+
+        // Clamp negatives and non-finite inputs to 0 so `@intFromFloat`
+        // stays in range. An upper cap protects against absurd float
+        // inputs; the text-length clamps below handle the real bound.
+        const max_cells: f32 = 1_000_000;
+        const row_f = point.f_y / cell_h;
+        const col_f = point.f_x / cell_w;
+        const row_clamped: f32 = if (std.math.isFinite(row_f))
+            @max(0, @min(row_f, max_cells))
+        else
+            0;
+        const col_clamped: f32 = if (std.math.isFinite(col_f))
+            @max(0, @min(col_f, max_cells))
+        else
+            0;
+        const want_row: u32 = @intFromFloat(row_clamped);
+        var col: u32 = @intFromFloat(col_clamped);
+
+        // Single-pass scan: find the byte offset where row `want_row`
+        // begins. If the point is past the last row, fall back to the
+        // start of whatever the last row in the buffer is.
+        var row_start: usize = 0;
+        var last_row_start: usize = 0;
+        var seen_newlines: u32 = 0;
+        var i: usize = 0;
+        while (i < text.len) : (i += 1) {
+            if (text[i] == '\n') {
+                seen_newlines += 1;
+                last_row_start = i + 1;
+                if (seen_newlines == want_row) {
+                    row_start = i + 1;
+                    break;
+                }
+            }
+        }
+        if (seen_newlines < want_row) row_start = last_row_start;
+
+        // Measure the codepoint length of the row and clamp the
+        // requested column to it.
+        var row_end: usize = row_start;
+        var row_cp_count: u32 = 0;
+        while (row_end < text.len and text[row_end] != '\n') {
+            row_end += utf8CpLen(text[row_end]);
+            row_cp_count += 1;
+        }
+        if (col > row_cp_count) col = row_cp_count;
+
+        // Advance `col` codepoints into the row. `row_start` and
+        // `row_end` are codepoint-aligned by construction, so the
+        // slice is safe to walk.
+        const byte_offset = row_start + utf8CpToByte(text[row_start..row_end], col);
+        out_offset.* = @intCast(utf8CpCount(text[0..byte_offset]));
+        return 1;
+    }
+
     /// Refresh the cached accessibility text from the terminal viewport.
     /// Returns the cached text. Uses a 500ms cache to avoid locking the
     /// renderer too frequently.
@@ -2784,17 +3007,84 @@ pub const Surface = extern struct {
             priv.ax_cached_text = null;
         }
 
+        // Free link entries from the previous refresh. Always safe: on
+        // older GTK the list is always empty (track_links is false).
+        self.clearAxLinks();
+        // Style runs are POD; drop them without per-item cleanup.
+        priv.ax_style_runs.clearRetainingCapacity();
+
         var buffer: std.ArrayList(u8) = .empty;
         defer buffer.deinit(alloc);
 
         const cursor = screen.cursor;
         var cursor_offset: ?c_uint = null;
 
+        // Codepoint counter tracked alongside `buffer.items.len`. Used
+        // to populate `ax_links` with AT-SPI-compliant codepoint
+        // offsets (see CLAUDE.md gotcha #7). Separate from the byte
+        // `cursor_offset` above, which is converted once at the end.
+        var cp_count: c_uint = 0;
+
+        // Whether to collect OSC 8 link ranges this refresh. Skipped on
+        // older GTK where the Hypertext interface isn't registered.
+        const track_links = a11y_hypertext.available;
+
+        // Currently-open run inside a single row. Closed and recorded
+        // into ax_links at the end of the row, on link-id transition,
+        // or on an interrupting blank cell. `uri` is a slice borrowed
+        // from `page.memory`; it must be dup'd before the renderer
+        // mutex is released.
+        var cur_link: ?struct {
+            id: terminal_hyperlink.Id,
+            start_cp: c_uint,
+            uri: []const u8,
+        } = null;
+
+        // Currently-open non-default style run. Closed and emitted
+        // into `ax_style_runs` at any boundary where the next
+        // emitted codepoint's style differs (different styled cell,
+        // blank-cell gap, `\n`, EOF). Coalesces identical adjacent
+        // cells into a single run — a viewport of mostly-default
+        // text collapses to zero runs and a fully-styled viewport
+        // collapses to roughly one run per contiguous SGR region
+        // per row (typical case: tens per viewport, not per cell).
+        const OpenRun = struct {
+            start_cp: c_uint,
+            style: terminal.Style,
+        };
+        var cur_style: ?OpenRun = null;
+        const closeStyle = struct {
+            fn f(
+                priv_inner: *Private,
+                cur: *?OpenRun,
+                end_cp: c_uint,
+            ) void {
+                const cs = cur.* orelse return;
+                if (end_cp > cs.start_cp) {
+                    priv_inner.ax_style_runs.append(
+                        std.heap.c_allocator,
+                        .{
+                            .start_cp = cs.start_cp,
+                            .end_cp = end_cp,
+                            .style = cs.style,
+                        },
+                    ) catch {};
+                }
+                cur.* = null;
+            }
+        }.f;
+
         const tl_pin = pages.getTopLeft(.viewport);
         var row_it = tl_pin.rowIterator(.right_down, null);
         var row_idx: usize = 0;
         while (row_idx < viewport_rows) : (row_idx += 1) {
-            if (row_idx > 0) buffer.append(alloc, '\n') catch return null;
+            if (row_idx > 0) {
+                // `\n` is a default-styled gap — close any open run
+                // before advancing `cp_count` past it.
+                closeStyle(priv, &cur_style, cp_count);
+                buffer.append(alloc, '\n') catch return null;
+                cp_count += 1;
+            }
 
             const pin = row_it.next() orelse continue;
             const is_cursor_row = row_idx == cursor.y;
@@ -2802,6 +3092,7 @@ pub const Surface = extern struct {
             if (is_cursor_row) cursor_offset = row_start;
 
             const cells = pin.cells(.all);
+            const page = &pin.node.data;
 
             // Accumulate empty cells so runs of trailing empties drop off the
             // end of the row, but intermediate gaps still get emitted as
@@ -2823,24 +3114,108 @@ pub const Surface = extern struct {
 
                 if (!cell.hasText()) {
                     blank_cells += 1;
+                    // A blank interrupts any open link run — the same
+                    // OSC 8 escape can bridge whitespace visually, but
+                    // splitting runs on blanks gives Orca a cleaner
+                    // per-word announcement and matches how a sighted
+                    // user perceives the link region.
+                    if (track_links) if (cur_link) |cl| {
+                        self.commitAxLink(cl.start_cp, cp_count, cl.uri);
+                        cur_link = null;
+                    };
                     continue;
                 }
 
-                buffer.appendNTimes(alloc, ' ', blank_cells) catch return null;
-                blank_cells = 0;
+                // Flush accumulated blanks as spaces. Each space is one
+                // codepoint and carries the default style; close any
+                // open styled run before the gap.
+                if (blank_cells > 0) {
+                    closeStyle(priv, &cur_style, cp_count);
+                    buffer.appendNTimes(alloc, ' ', blank_cells) catch return null;
+                    cp_count += @intCast(blank_cells);
+                    blank_cells = 0;
+                }
+
+                // Resolve this cell's style from its page. Cells that
+                // took the `!hasText()` branch above are never seen
+                // here, so content_tag is codepoint / codepoint_grapheme;
+                // `hasStyling()` is the default_id gate (0 → default).
+                const cell_style: terminal.Style = if (cell.hasStyling())
+                    page.styles.get(page.memory, cell.style_id).*
+                else
+                    .{};
+
+                // Transition the style run: continue if identical to
+                // the open run, otherwise close and (if non-default)
+                // open a new one at the current cp_count.
+                const cell_default = cell_style.default();
+                if (cur_style) |cs| {
+                    if (!cs.style.eql(cell_style)) {
+                        closeStyle(priv, &cur_style, cp_count);
+                        if (!cell_default) cur_style = .{
+                            .start_cp = cp_count,
+                            .style = cell_style,
+                        };
+                    }
+                } else if (!cell_default) {
+                    cur_style = .{
+                        .start_cp = cp_count,
+                        .style = cell_style,
+                    };
+                }
+
+                // Determine the link on this cell BEFORE writing, so a
+                // new run's start_cp matches where this cell's
+                // codepoints land in the buffer.
+                var cell_link: ?struct {
+                    id: terminal_hyperlink.Id,
+                    uri: []const u8,
+                } = null;
+                if (track_links and cell.hyperlink) {
+                    if (page.lookupHyperlink(cell)) |lid| {
+                        const entry = page.hyperlink_set.get(page.memory, lid);
+                        cell_link = .{
+                            .id = lid,
+                            .uri = entry.uri.slice(page.memory),
+                        };
+                    }
+                }
+
+                // Transition: close current run if the link changed or
+                // ended. Link ids are unique only within a page, but
+                // rows don't straddle pages and we also close on row
+                // boundaries, so same-id across cells within a row is
+                // a valid continuity check.
+                if (cur_link) |cl| {
+                    const continues = if (cell_link) |nl| nl.id == cl.id else false;
+                    if (!continues) {
+                        self.commitAxLink(cl.start_cp, cp_count, cl.uri);
+                        cur_link = null;
+                    }
+                }
+                if (cur_link == null) {
+                    if (cell_link) |nl| cur_link = .{
+                        .id = nl.id,
+                        .start_cp = cp_count,
+                        .uri = nl.uri,
+                    };
+                }
 
                 var ubuf: [4]u8 = undefined;
                 const n = std.unicode.utf8Encode(cell.codepoint(), &ubuf) catch {
                     buffer.append(alloc, '?') catch return null;
+                    cp_count += 1;
                     continue;
                 };
                 buffer.appendSlice(alloc, ubuf[0..n]) catch return null;
+                cp_count += 1;
 
                 if (cell.hasGrapheme()) {
                     if (pin.grapheme(cell)) |graphemes| {
                         for (graphemes) |cp| {
                             const gn = std.unicode.utf8Encode(cp, &ubuf) catch continue;
                             buffer.appendSlice(alloc, ubuf[0..gn]) catch return null;
+                            cp_count += 1;
                         }
                     }
                 }
@@ -2851,7 +3226,24 @@ pub const Surface = extern struct {
             if (is_cursor_row and cursor.x >= cells.len) {
                 cursor_offset = @intCast(buffer.items.len);
             }
+
+            // End of row: close any open link. Links don't span '\n'
+            // in the accessibility view — each visual line becomes its
+            // own navigable Hyperlink.
+            if (track_links) if (cur_link) |cl| {
+                self.commitAxLink(cl.start_cp, cp_count, cl.uri);
+                cur_link = null;
+            };
         }
+
+        // Close any style run still open at end-of-viewport.
+        closeStyle(priv, &cur_style, cp_count);
+
+        // Scan the built buffer for configured regex links (bare URLs,
+        // user-configured patterns). Runs after the cell walk so that
+        // OSC 8 ranges are already in `ax_links` and we can dedup
+        // overlapping regex matches against them.
+        if (track_links) self.axMatchRegexLinks(buffer.items, core_surface);
 
         const text = alloc.dupeZ(u8, buffer.items) catch return null;
         priv.ax_cached_text = text;
@@ -2864,6 +3256,215 @@ pub const Surface = extern struct {
         priv.ax_cached_cursor_offset = @intCast(utf8CpCount(text[0..cursor_byte_clamped]));
 
         return priv.ax_cached_text;
+    }
+
+    /// Release every entry in `priv.ax_links`: unparent the hyperlink
+    /// (tearing down its `GtkATContext` and unregistering it from the
+    /// AT-SPI bus), unref the object, and free the owned URI. Safe to
+    /// call repeatedly and on older GTK (the list is never populated
+    /// there).
+    ///
+    /// Unparenting BEFORE unref is required. `ensureAxLinksWired` sets
+    /// each link's parent to the Surface, which realizes its AT context
+    /// and exports it on the AT-SPI D-Bus. If we unref while the context
+    /// is still parented, the hyperlink hits refcount zero and GLib
+    /// scribbles `0xffffffff` sentinels into the freed instance, but
+    /// the bridge keeps the D-Bus path alive with a dangling
+    /// `accessible` pointer. The next inbound method from Orca for
+    /// that path SIGSEGVs inside `gtk_accessible_get_at_context` on
+    /// the freed class pointer, taking Orca down with it when the
+    /// faulted reply unmarshals on its side. Clearing the parent
+    /// first disposes the context and removes the D-Bus export.
+    fn clearAxLinks(self: *Self) void {
+        const priv = self.private();
+        const alloc = std.heap.c_allocator;
+        for (priv.ax_links.items) |link| {
+            const link_acc: *gtk.Accessible = @ptrCast(@alignCast(link.obj));
+            link_acc.setAccessibleParent(null, null);
+            link.obj.unref();
+            alloc.free(link.uri);
+        }
+        priv.ax_links.clearRetainingCapacity();
+    }
+
+    /// Record a discovered link range. Dup's the URI (which is
+    /// borrowed from page memory and only valid while the renderer
+    /// mutex is held) and constructs a GtkAccessibleHyperlink. Any
+    /// allocation failure is logged and the link is skipped rather
+    /// than surfaced — a missing link degrades to "announced as
+    /// plain text", never a crash.
+    fn commitAxLink(
+        self: *Self,
+        start_cp: c_uint,
+        end_cp: c_uint,
+        uri: []const u8,
+    ) void {
+        if (start_cp >= end_cp) return;
+
+        const priv = self.private();
+        const alloc = std.heap.c_allocator;
+
+        const uri_owned = alloc.dupeZ(u8, uri) catch |err| {
+            log.warn("ax_link uri dup failed: {}", .{err});
+            return;
+        };
+
+        var bounds: gtk.AccessibleTextRange = .{
+            .f_start = start_cp,
+            .f_length = end_cp - start_cp,
+        };
+        const index: c_uint = @intCast(priv.ax_links.items.len);
+        const obj = a11y_hypertext.hyperlinkNew(
+            @ptrCast(self),
+            index,
+            uri_owned.ptr,
+            &bounds,
+        );
+
+        // Note: we intentionally do NOT call
+        // `gtk_accessible_set_accessible_parent` here. `commitAxLink`
+        // runs under the renderer mutex inside `axRefreshCache`, and
+        // realize → AT-SPI tree-change signal → Orca re-queries us,
+        // which would re-enter `axRefreshCache` and deadlock on the
+        // mutex. Parent wiring is deferred to `ensureAxLinksWired`,
+        // which runs outside the lock.
+
+        priv.ax_links.append(alloc, .{
+            .start_cp = start_cp,
+            .end_cp = end_cp,
+            .uri = uri_owned,
+            .obj = obj,
+        }) catch |err| {
+            log.warn("ax_link append failed: {}", .{err});
+            alloc.free(uri_owned);
+            obj.unref();
+            return;
+        };
+    }
+
+    /// Scan the freshly-built viewport buffer for configured regex
+    /// links (bare URLs, user-defined patterns) and record them as
+    /// hyperlinks alongside OSC 8 entries.
+    ///
+    /// Blind users can't "hover" to reveal a link, so every
+    /// configured pattern is matched regardless of its `highlight`
+    /// mode — the highlight gate (`hover`, `always_mods`, etc.)
+    /// exists for visual cue purposes on sighted flows, not for
+    /// whether a region is semantically a link.
+    ///
+    /// Dedupes against already-committed OSC 8 ranges: when a
+    /// regex match overlaps an OSC 8 link, the OSC 8 link wins
+    /// (its URI is explicit and authoritative; the regex is a
+    /// guess).
+    ///
+    /// Caller must hold `core_surface.renderer_state.mutex` so
+    /// the `oni.Regex` objects in `core_surface.config.links`
+    /// aren't torn down mid-search.
+    fn axMatchRegexLinks(
+        self: *Self,
+        text: []const u8,
+        core_surface: *CoreSurface,
+    ) void {
+        if (text.len == 0) return;
+        const links_config = core_surface.config.links;
+        if (links_config.len == 0) return;
+
+        // Snapshot the OSC 8 range set before emitting any regex
+        // hits, so we only check new regex matches against OSC 8
+        // links — not against earlier regex matches from the same
+        // refresh. If two configured regexes both fire on the
+        // same span, both land; Orca's `_adjust_for_links` merely
+        // announces "link" per hit, which is no worse than a
+        // duplicated OSC 8 scenario.
+        const priv = self.private();
+        const osc8_end = priv.ax_links.items.len;
+
+        for (links_config) |*link_cfg| {
+            // Incrementally track byte → codepoint position
+            // through `text` so regex offset conversion is O(n)
+            // across all matches for this regex, not O(k·n).
+            // Resets per configured regex (byte_offset rewinds).
+            var scan_byte: usize = 0;
+            var scan_cp: c_uint = 0;
+
+            var byte_offset: usize = 0;
+            while (byte_offset < text.len) {
+                var region = link_cfg.regex.search(
+                    text[byte_offset..],
+                    .{},
+                ) catch |err| switch (err) {
+                    error.Mismatch => break,
+                    else => {
+                        log.warn(
+                            "ax regex search failed: {}",
+                            .{err},
+                        );
+                        break;
+                    },
+                };
+                defer region.deinit();
+
+                const rel_start: usize = @intCast(region.starts()[0]);
+                const rel_end: usize = @intCast(region.ends()[0]);
+                const abs_start = byte_offset + rel_start;
+                const abs_end = byte_offset + rel_end;
+
+                // Guard against zero-width matches looping
+                // forever (`a*` etc).
+                byte_offset = if (abs_end > byte_offset)
+                    abs_end
+                else
+                    byte_offset + 1;
+
+                if (abs_end <= abs_start) continue;
+
+                // URL regex shouldn't match newlines, but if a
+                // user-supplied regex crosses one we clip to the
+                // first '\n' so the hyperlink stays on a single
+                // visual row — matches the per-row splitting we
+                // apply to OSC 8 runs during the cell walk.
+                var clipped_end = abs_end;
+                for (text[abs_start..abs_end], 0..) |b, i| {
+                    if (b == '\n') {
+                        clipped_end = abs_start + i;
+                        break;
+                    }
+                }
+                if (clipped_end <= abs_start) continue;
+
+                // Advance the cp cursor to abs_start, recording
+                // cp_start, then to clipped_end for cp_end. Since
+                // regex matches within one config are in byte
+                // order, `scan_byte` is monotonic.
+                while (scan_byte < abs_start) {
+                    scan_cp += 1;
+                    scan_byte += utf8CpLen(text[scan_byte]);
+                }
+                const cp_start = scan_cp;
+                while (scan_byte < clipped_end) {
+                    scan_cp += 1;
+                    scan_byte += utf8CpLen(text[scan_byte]);
+                }
+                const cp_end = scan_cp;
+
+                var overlaps = false;
+                for (priv.ax_links.items[0..osc8_end]) |existing| {
+                    if (cp_start < existing.end_cp and
+                        cp_end > existing.start_cp)
+                    {
+                        overlaps = true;
+                        break;
+                    }
+                }
+                if (overlaps) continue;
+
+                self.commitAxLink(
+                    cp_start,
+                    cp_end,
+                    text[abs_start..clipped_end],
+                );
+            }
+        }
     }
 
     /// Check whether the terminal text or caret has changed since the last
@@ -2893,67 +3494,42 @@ pub const Surface = extern struct {
         const new_text = self.axRefreshCache() orelse return;
         const old_text: []const u8 = priv.ax_last_snapshot orelse "";
 
-        // Common prefix (byte-wise).
-        var p: usize = 0;
-        const min_len = @min(old_text.len, new_text.len);
-        while (p < min_len and old_text[p] == new_text[p]) : (p += 1) {}
-
-        // Common suffix, bounded so it can't overlap the prefix on either
-        // side (otherwise the remove/insert ranges would go negative).
-        var s: usize = 0;
-        const max_s = @min(old_text.len - p, new_text.len - p);
-        while (s < max_s and
-            old_text[old_text.len - 1 - s] == new_text[new_text.len - 1 - s]) : (s += 1)
-        {}
-
-        // `p` and `old_text.len - s` must land on UTF-8 codepoint
-        // boundaries — otherwise the remove/insert substring we hand to
-        // GTK's AT-SPI bridge contains orphan continuation bytes, and
-        // `g_variant_new_string` returns NULL, making `g_variant_new`
-        // SIGSEGV inside `g_variant_builder_add_value`. Two multi-byte
-        // codepoints that share a leading byte (e.g. `│` and `├`, both
-        // starting with 0xE2 0x94) will let the byte-wise prefix walk
-        // into the middle of a character. The `p < old_text.len` guard
-        // matters when `old` is a prefix of `new` (common when only the
-        // caret moved): then `p == old_text.len` and indexing would go
-        // out of bounds — but end-of-buffer is already a codepoint
-        // boundary, so no alignment is needed.
-        while (p > 0 and p < old_text.len and (old_text[p] & 0xC0) == 0x80) : (p -= 1) {}
-        while (s > 0 and (old_text[old_text.len - s] & 0xC0) == 0x80) : (s -= 1) {}
-
-        const removed_len = old_text.len - p - s;
-        const inserted_len = new_text.len - p - s;
-        const text_changed = removed_len != 0 or inserted_len != 0;
+        const text_changed = !std.mem.eql(u8, old_text, new_text);
         const caret_changed = priv.ax_cached_cursor_offset != priv.ax_last_notified_caret;
 
-        if (!text_changed and !caret_changed) return;
+        // Check whether the selection state changed since our last
+        // notification. Read the selection under the renderer mutex
+        // (separate from axRefreshCache's cycle, which has already
+        // released).
+        const SelState = struct { has: bool, start: c_uint, end: c_uint };
+        const no_sel = SelState{ .has = false, .start = 0, .end = 0 };
+        const sel_state: SelState = sel_state: {
+            const core_surface = priv.core_surface orelse break :sel_state no_sel;
+            core_surface.renderer_state.mutex.lock();
+            defer core_surface.renderer_state.mutex.unlock();
+            const screen: *terminal.Screen = core_surface.renderer_state.terminal.screens.active;
+            const sel = screen.selection orelse break :sel_state no_sel;
+            const tl = sel.topLeft(screen);
+            const br = sel.bottomRight(screen);
+            const tl_vp = screen.pages.pointFromPin(.viewport, tl) orelse break :sel_state no_sel;
+            const br_vp = screen.pages.pointFromPin(.viewport, br) orelse break :sel_state no_sel;
+            const s = rowColToCp(new_text, tl_vp.viewport.y, tl_vp.viewport.x) orelse 0;
+            const e_inc = rowColToCp(new_text, br_vp.viewport.y, br_vp.viewport.x) orelse 0;
+            break :sel_state SelState{
+                .has = true,
+                .start = @intCast(s),
+                .end = @intCast(e_inc + 1),
+            };
+        };
+        const selection_changed = sel_state.has != priv.ax_last_had_selection or
+            sel_state.start != priv.ax_last_selection_start or
+            sel_state.end != priv.ax_last_selection_end;
+
+        if (!text_changed and !caret_changed and !selection_changed) return;
 
         const ax_self: *gtk.AccessibleText = @ptrCast(self);
         if (text_changed) {
-            // AT-SPI positions are in UTF-8 codepoint units, not bytes.
-            const start_cp: c_uint = @intCast(utf8CpCount(old_text[0..p]));
-            if (removed_len != 0) {
-                // GTK's AT-SPI bridge fills `any_data` by calling back into
-                // `axGetContents(start, end)` synchronously during the
-                // updateContents call. For a remove event, the AT client
-                // expects the *deleted* substring — but our cache already
-                // holds the post-deletion text. Swap in the old snapshot
-                // so the bridge sees the deleted range. The cache timestamp
-                // stays fresh from the refresh above, so axRefreshCache
-                // will return our swapped pointer rather than re-reading.
-                const saved_cache = priv.ax_cached_text;
-                const saved_cursor = priv.ax_cached_cursor_offset;
-                priv.ax_cached_text = priv.ax_last_snapshot;
-                priv.ax_cached_cursor_offset = priv.ax_last_notified_caret;
-                const end_cp: c_uint = @intCast(utf8CpCount(old_text[0..(old_text.len - s)]));
-                gtk.AccessibleText.updateContents(ax_self, .remove, start_cp, end_cp);
-                priv.ax_cached_text = saved_cache;
-                priv.ax_cached_cursor_offset = saved_cursor;
-            }
-            if (inserted_len != 0) {
-                const end_cp: c_uint = @intCast(utf8CpCount(new_text[0..(new_text.len - s)]));
-                gtk.AccessibleText.updateContents(ax_self, .insert, start_cp, end_cp);
-            }
+            self.axEmitTextDiff(old_text, new_text);
 
             // Replace the snapshot. We own a copy via c_allocator rather
             // than aliasing `ax_cached_text` because the cache is freed
@@ -2965,6 +3541,174 @@ pub const Surface = extern struct {
         if (caret_changed) {
             priv.ax_last_notified_caret = priv.ax_cached_cursor_offset;
             gtk.AccessibleText.updateCaretPosition(ax_self);
+        }
+        if (selection_changed) {
+            priv.ax_last_had_selection = sel_state.has;
+            priv.ax_last_selection_start = sel_state.start;
+            priv.ax_last_selection_end = sel_state.end;
+            gtk.AccessibleText.updateSelectionBound(ax_self);
+        }
+    }
+
+    /// Prefix/suffix diff: bytes `[0..p)` and `[len-s..)` are unchanged, the
+    /// rest was replaced. `p` and `old.len - s` are guaranteed to land on
+    /// UTF-8 codepoint boundaries in `old`.
+    const PrefixSuffixDiff = struct {
+        p: usize,
+        s: usize,
+    };
+
+    /// Compute the byte-wise common prefix and suffix of `old` and `new`,
+    /// then pull both offsets back to UTF-8 codepoint boundaries.
+    ///
+    /// Alignment matters because two multi-byte codepoints can share a
+    /// leading byte (e.g. `│` and `├`, both starting with 0xE2 0x94), and
+    /// a byte-wise compare can land inside a character. Handing an orphan
+    /// continuation byte to GTK's AT-SPI bridge makes `g_variant_new_string`
+    /// return NULL, which SIGSEGVs inside `g_variant_builder_add_value`.
+    fn axComputePrefixSuffix(old_text: []const u8, new_text: []const u8) PrefixSuffixDiff {
+        var p: usize = 0;
+        const min_len = @min(old_text.len, new_text.len);
+        while (p < min_len and old_text[p] == new_text[p]) : (p += 1) {}
+
+        // Cap the suffix so it can't overlap the prefix (that would make
+        // the remove/insert ranges go negative).
+        var s: usize = 0;
+        const max_s = @min(old_text.len - p, new_text.len - p);
+        while (s < max_s and
+            old_text[old_text.len - 1 - s] == new_text[new_text.len - 1 - s]) : (s += 1)
+        {}
+
+        // The `p < old_text.len` guard matters when `old_text` is a prefix
+        // of `new_text`: `p == old_text.len` and indexing would go out of
+        // bounds, but end-of-buffer is already a codepoint boundary.
+        while (p > 0 and p < old_text.len and (old_text[p] & 0xC0) == 0x80) : (p -= 1) {}
+        while (s > 0 and (old_text[old_text.len - s] & 0xC0) == 0x80) : (s -= 1) {}
+
+        return .{ .p = p, .s = s };
+    }
+
+    /// Look for a whole-line scroll up: a K > 0 at a `\n` boundary of
+    /// `old` such that `new[0..|old|-K] == old[K..]`. Returns 0 if no
+    /// such K exists. Since `\n` is ASCII, every candidate K is already
+    /// a UTF-8 codepoint boundary.
+    fn axComputeScrollK(old_text: []const u8, new_text: []const u8) usize {
+        if (old_text.len == 0) return 0;
+        var i: usize = 0;
+        while (i < old_text.len) : (i += 1) {
+            if (old_text[i] != '\n') continue;
+            const boundary = i + 1;
+            const remainder = old_text.len - boundary;
+            // A zero-byte remainder matches trivially at every trailing
+            // `\n` and would mask the prefix/suffix diff for every change
+            // where old_text ends in `\n`. Require a non-trivial middle.
+            if (remainder == 0 or remainder > new_text.len) continue;
+            if (std.mem.eql(u8, new_text[0..remainder], old_text[boundary..])) {
+                return boundary;
+            }
+        }
+        return 0;
+    }
+
+    /// Pick between a prefix/suffix diff and a line-shift scroll diff based
+    /// on which emits fewer bytes, and fire the corresponding AT-SPI events.
+    ///
+    /// The comparison matters: on a real whole-line scroll, prefix/suffix
+    /// covers nearly the whole viewport (the middle shifted position) and
+    /// scroll wins. But scroll detection can also match spuriously on a
+    /// typing-echo change — e.g. typing `x` at a `$ ` prompt when earlier
+    /// rows also end in `$ ` — because the last row of old happens to be
+    /// a prefix of new. Picking the cheaper diff avoids that trap.
+    ///
+    /// Modelling scrolls as `.remove` at the top + `.insert` at the tail
+    /// also matches what VTE/gnome-terminal expose to AT-SPI, which is
+    /// what Orca's terminal script is written against.
+    fn axEmitTextDiff(self: *Self, old_text: []const u8, new_text: []const u8) void {
+        const ps = axComputePrefixSuffix(old_text, new_text);
+        const ps_total = (old_text.len - ps.p - ps.s) + (new_text.len - ps.p - ps.s);
+
+        const scroll_k = axComputeScrollK(old_text, new_text);
+        const scroll_total = if (scroll_k > 0)
+            scroll_k + (new_text.len - (old_text.len - scroll_k))
+        else
+            std.math.maxInt(usize);
+
+        if (scroll_k > 0 and scroll_total < ps_total) {
+            self.axEmitScroll(old_text, new_text, scroll_k);
+        } else if (ps_total > 0) {
+            self.axEmitPrefixSuffix(old_text, new_text, ps);
+        }
+    }
+
+    /// Emit a `.remove(0, K_cp)` + `.insert(tail_cp, |new|_cp)` pair for a
+    /// line-shift scroll. `scroll_k` must be > 0 and landing on a `\n`
+    /// boundary of `old` (guaranteed by `axComputeScrollK`).
+    fn axEmitScroll(
+        self: *Self,
+        old_text: []const u8,
+        new_text: []const u8,
+        scroll_k: usize,
+    ) void {
+        const priv = self.private();
+        const ax_self: *gtk.AccessibleText = @ptrCast(self);
+
+        const removed_cp: c_uint = @intCast(utf8CpCount(old_text[0..scroll_k]));
+        const tail_cp: c_uint = @intCast(utf8CpCount(old_text[scroll_k..]));
+        const new_end_cp: c_uint = @intCast(utf8CpCount(new_text));
+
+        // `.remove(0, removed_cp)`: GTK's bridge calls axGetContents
+        // synchronously during the emit, so the cache must point at the
+        // pre-remove (old) text for the duration of the call.
+        {
+            const saved_cache = priv.ax_cached_text;
+            const saved_cursor = priv.ax_cached_cursor_offset;
+            priv.ax_cached_text = priv.ax_last_snapshot;
+            priv.ax_cached_cursor_offset = priv.ax_last_notified_caret;
+            gtk.AccessibleText.updateContents(ax_self, .remove, 0, removed_cp);
+            priv.ax_cached_text = saved_cache;
+            priv.ax_cached_cursor_offset = saved_cursor;
+        }
+
+        if (new_end_cp > tail_cp) {
+            gtk.AccessibleText.updateContents(ax_self, .insert, tail_cp, new_end_cp);
+        }
+    }
+
+    /// Emit a single remove+insert pair covering the region between the
+    /// common prefix and common suffix of `old` and `new`.
+    fn axEmitPrefixSuffix(
+        self: *Self,
+        old_text: []const u8,
+        new_text: []const u8,
+        diff: PrefixSuffixDiff,
+    ) void {
+        const p = diff.p;
+        const s = diff.s;
+        const removed_len = old_text.len - p - s;
+        const inserted_len = new_text.len - p - s;
+
+        const priv = self.private();
+        const ax_self: *gtk.AccessibleText = @ptrCast(self);
+        const start_cp: c_uint = @intCast(utf8CpCount(old_text[0..p]));
+        if (removed_len != 0) {
+            // GTK's AT-SPI bridge fills `any_data` by calling back into
+            // `axGetContents(start, end)` synchronously during the
+            // updateContents call. For a remove event, the AT client
+            // expects the *deleted* substring — but our cache already
+            // holds the post-deletion text. Swap in the old snapshot so
+            // the bridge sees the deleted range.
+            const saved_cache = priv.ax_cached_text;
+            const saved_cursor = priv.ax_cached_cursor_offset;
+            priv.ax_cached_text = priv.ax_last_snapshot;
+            priv.ax_cached_cursor_offset = priv.ax_last_notified_caret;
+            const end_cp: c_uint = @intCast(utf8CpCount(old_text[0..(old_text.len - s)]));
+            gtk.AccessibleText.updateContents(ax_self, .remove, start_cp, end_cp);
+            priv.ax_cached_text = saved_cache;
+            priv.ax_cached_cursor_offset = saved_cursor;
+        }
+        if (inserted_len != 0) {
+            const end_cp: c_uint = @intCast(utf8CpCount(new_text[0..(new_text.len - s)]));
+            gtk.AccessibleText.updateContents(ax_self, .insert, start_cp, end_cp);
         }
     }
 
@@ -3145,28 +3889,536 @@ pub const Surface = extern struct {
         return self.private().ax_cached_cursor_offset;
     }
 
+    /// GTK 4.22 `GtkAccessibleText.set_caret_position` vfunc. Dispatched
+    /// only when running against GTK >= 4.22 (see `accessibleTextIfaceInit`).
+    ///
+    /// AT-SPI has no direct way to move a terminal cursor — the shell owns
+    /// the PTY caret — so we synthesize a left-click at the cell that
+    /// corresponds to `offset`. Shells with shell-integration (fish/zsh
+    /// via Ghostty's hooks, per `Surface.maybePromptClick`) translate this
+    /// into the appropriate cursor-word movement keystrokes; raw terminals
+    /// see it as a benign click with no selection.
+    ///
+    /// `offset` is a codepoint index into `ax_cached_text` (per CLAUDE.md
+    /// gotcha #7). The click point mirrors `axGetExtents` geometry — no
+    /// padding adjustment, cell center — so round-tripping
+    /// `get_extents` → `set_caret_position` stays internally consistent.
+    fn axSetCaretPosition(
+        self_opaque: *gtk.AccessibleText,
+        offset: c_uint,
+    ) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(self_opaque));
+        const priv = self.private();
+        const core_surface = priv.core_surface orelse return 0;
+
+        const text = self.axRefreshCache() orelse return 0;
+
+        const text_cp_count: c_uint = @intCast(utf8CpCount(text));
+        // Clamp to the last codepoint rather than past-the-end so the
+        // cell lookup below always lands on a valid cell.
+        const off_cp: c_uint = if (text_cp_count == 0)
+            0
+        else
+            @min(offset, text_cp_count - 1);
+        const off_byte = utf8CpToByte(text, off_cp);
+
+        var row: u32 = 0;
+        for (text[0..off_byte]) |ch| {
+            if (ch == '\n') row += 1;
+        }
+
+        var row_start: usize = off_byte;
+        while (row_start > 0 and text[row_start - 1] != '\n') : (row_start -= 1) {}
+        const col: u32 = @intCast(utf8CpCount(text[row_start..off_byte]));
+
+        const cell_w: f32 = @floatFromInt(core_surface.size.cell.width);
+        const cell_h: f32 = @floatFromInt(core_surface.size.cell.height);
+        if (cell_w <= 0 or cell_h <= 0) return 0;
+
+        // Click at cell center. `core_surface` tracks cursor pos in the
+        // same physical-pixel space that `ecMouseMotion` feeds it (via
+        // `scaledCoordinates`) — and `core_surface.size.cell.*` is in
+        // physical pixels too, so no scaling here.
+        //
+        // Cell (0,0) does NOT start at widget-local (0,0): the renderer
+        // leaves `size.padding.{left,top}` for a gutter around the cell
+        // grid. Forgetting this lands the click in the padding area and
+        // nvim (or any mouse-reporting TUI) silently ignores it. Same
+        // offset math used by `Surface.computeCursorRect` in
+        // `src/Surface.zig` (see line ~2103).
+        const pad_left: f32 = @floatFromInt(core_surface.size.padding.left);
+        const pad_top: f32 = @floatFromInt(core_surface.size.padding.top);
+        const pos: apprt.CursorPos = .{
+            .x = pad_left + @as(f32, @floatFromInt(col)) * cell_w + cell_w / 2.0,
+            .y = pad_top + @as(f32, @floatFromInt(row)) * cell_h + cell_h / 2.0,
+        };
+
+        // `mouseButtonCallback` internally queries the apprt's stored
+        // cursor position via `rt_surface.getCursorPos()` rather than
+        // trusting state we set through the core surface. On the real
+        // GTK mouse path, `ecMouseMotion` stores that position directly
+        // on `priv.cursor_pos` BEFORE calling the core callback. We
+        // mirror both halves here, otherwise mouseButtonCallback ignores
+        // our synthetic motion and clicks at the physical mouse's
+        // position instead.
+        const saved_cursor_pos = priv.cursor_pos;
+        priv.cursor_pos = pos;
+        defer priv.cursor_pos = saved_cursor_pos;
+
+        core_surface.cursorPosCallback(pos, null) catch |err| {
+            log.warn("axSetCaretPosition: cursorPosCallback failed err={}", .{err});
+            return 0;
+        };
+        _ = core_surface.mouseButtonCallback(.press, .left, .{}) catch |err| {
+            log.warn("axSetCaretPosition: mouseButtonCallback press failed err={}", .{err});
+            return 0;
+        };
+        _ = core_surface.mouseButtonCallback(.release, .left, .{}) catch |err| {
+            log.warn("axSetCaretPosition: mouseButtonCallback release failed err={}", .{err});
+            return 0;
+        };
+
+        return 1;
+    }
+
+    /// Report the terminal's active selection (if any) to the AT client.
+    ///
+    /// We only report a selection when both endpoints are inside the
+    /// viewport — selections extending into scrollback have no position
+    /// in our snapshot text, which is viewport-only (see `axRefreshCache`).
+    /// Returning FALSE in that case keeps AT clients from trying to
+    /// reference offsets that don't exist in our exposed text.
+    ///
+    /// Offsets handed back are UTF-8 codepoint indices (CLAUDE.md gotcha
+    /// #7), computed against the snapshot the rest of the AccessibleText
+    /// vfuncs use.
     fn axGetSelection(
         self_opaque: *gtk.AccessibleText,
         n_ranges: *usize,
-        _: ?*[*]gtk.AccessibleTextRange,
+        out_ranges: ?*[*]gtk.AccessibleTextRange,
     ) callconv(.c) c_int {
-        _ = self_opaque;
-        n_ranges.* = 0;
-        return 0; // FALSE = no selection
+        const self: *Self = @ptrCast(@alignCast(self_opaque));
+        const priv = self.private();
+        const core_surface = priv.core_surface orelse {
+            n_ranges.* = 0;
+            return 0;
+        };
+
+        const text = self.axRefreshCache() orelse {
+            n_ranges.* = 0;
+            return 0;
+        };
+
+        // Take the renderer mutex afresh to read the selection. Must be
+        // separate from the `axRefreshCache` lock cycle — that one has
+        // already released by the time we got here.
+        core_surface.renderer_state.mutex.lock();
+        const t: *terminal.Terminal = core_surface.renderer_state.terminal;
+        const screen: *terminal.Screen = t.screens.active;
+        const sel = screen.selection orelse {
+            core_surface.renderer_state.mutex.unlock();
+            n_ranges.* = 0;
+            return 0;
+        };
+        const tl = sel.topLeft(screen);
+        const br = sel.bottomRight(screen);
+        const tl_vp = screen.pages.pointFromPin(.viewport, tl);
+        const br_vp = screen.pages.pointFromPin(.viewport, br);
+        core_surface.renderer_state.mutex.unlock();
+
+        // Selection with at least one endpoint outside the viewport:
+        // our snapshot can't represent it. Fail cleanly.
+        const tl_pt = tl_vp orelse {
+            n_ranges.* = 0;
+            return 0;
+        };
+        const br_pt = br_vp orelse {
+            n_ranges.* = 0;
+            return 0;
+        };
+        const tl_row: u32 = tl_pt.viewport.y;
+        const tl_col: u32 = tl_pt.viewport.x;
+        const br_row: u32 = br_pt.viewport.y;
+        const br_col: u32 = br_pt.viewport.x;
+
+        // Convert (row, col) to codepoint offsets in the snapshot.
+        // Same mapping as `axGetExtents` / `axSetCaretPosition`: each
+        // viewport row is delimited by '\n'; one codepoint per cell.
+        const start_cp = rowColToCp(text, tl_row, tl_col) orelse {
+            n_ranges.* = 0;
+            return 0;
+        };
+        // End is inclusive on the cell; AT-SPI range length is exclusive,
+        // so add 1 to cover the last cell.
+        const end_cp_inclusive = rowColToCp(text, br_row, br_col) orelse {
+            n_ranges.* = 0;
+            return 0;
+        };
+        const end_cp = end_cp_inclusive + 1;
+        if (end_cp <= start_cp) {
+            n_ranges.* = 0;
+            return 0;
+        }
+
+        if (out_ranges) |out| {
+            const range_ptr = glib.malloc(@sizeOf(gtk.AccessibleTextRange));
+            const range: [*]gtk.AccessibleTextRange = @ptrCast(@alignCast(range_ptr));
+            range[0] = .{
+                .f_start = start_cp,
+                .f_length = end_cp - start_cp,
+            };
+            out.* = range;
+        }
+        n_ranges.* = 1;
+        return 1;
     }
 
+    /// Map (row, col) in the snapshot to a codepoint offset. Returns null
+    /// when `row` is past the last row in `text`.
+    fn rowColToCp(text: []const u8, row: u32, col: u32) ?usize {
+        var seen_nl: u32 = 0;
+        var row_start: usize = 0;
+        if (row > 0) {
+            var i: usize = 0;
+            while (i < text.len) : (i += 1) {
+                if (text[i] == '\n') {
+                    seen_nl += 1;
+                    if (seen_nl == row) {
+                        row_start = i + 1;
+                        break;
+                    }
+                }
+            }
+            if (seen_nl < row) return null;
+        }
+        var row_end: usize = row_start;
+        var row_cp: u32 = 0;
+        while (row_end < text.len and text[row_end] != '\n') {
+            row_end += utf8CpLen(text[row_end]);
+            row_cp += 1;
+        }
+        const clamped_col: u32 = @min(col, row_cp);
+        const row_prefix_cp = utf8CpCount(text[0..row_start]);
+        return row_prefix_cp + clamped_col;
+    }
+
+    /// GTK 4.22 `GtkAccessibleText.set_selection` vfunc. Dispatched only
+    /// when running against GTK >= 4.22 (see `accessibleTextIfaceInit`).
+    ///
+    /// `range.f_start` and `range.f_length` are UTF-8 codepoint units
+    /// (CLAUDE.md gotcha #7) in the snapshot text. We translate them
+    /// back to terminal (row, col) via the same inverse used by
+    /// `axSetCaretPosition`, then build an untracked `terminal.Selection`
+    /// from the resulting viewport pins and hand it to
+    /// `Screen.select`. `select` promotes the pins to tracked and
+    /// stores the selection; it also flips `dirty.selection = true` so
+    /// the next frame paints the highlight.
+    ///
+    /// Lock discipline: `axRefreshCache` takes the renderer mutex
+    /// internally. We must release it before taking the mutex again
+    /// for the pin/selection write — holding it across both reads
+    /// races nothing but breaks `screen.select`'s expectations that
+    /// it owns the mutex in its own scope.
+    fn axSetSelection(
+        self_opaque: *gtk.AccessibleText,
+        i: usize,
+        range: *gtk.AccessibleTextRange,
+    ) callconv(.c) c_int {
+        if (i != 0) return 0;
+
+        const self: *Self = @ptrCast(@alignCast(self_opaque));
+        const priv = self.private();
+        const core_surface = priv.core_surface orelse return 0;
+
+        const text = self.axRefreshCache() orelse return 0;
+        const text_cp_count: usize = utf8CpCount(text);
+
+        // Empty range → clear selection.
+        if (range.f_length == 0) {
+            core_surface.renderer_state.mutex.lock();
+            core_surface.renderer_state.terminal.screens.active.clearSelection();
+            core_surface.renderer_state.mutex.unlock();
+            self.redraw();
+            return 1;
+        }
+
+        const start_cp: usize = @min(range.f_start, text_cp_count);
+        // Saturating add so absurd (untrusted) AT-SPI values don't wrap.
+        const raw_end = std.math.add(usize, range.f_start, range.f_length) catch text_cp_count;
+        const end_cp_exclusive: usize = @min(raw_end, text_cp_count);
+        if (end_cp_exclusive <= start_cp) return 0;
+        const end_cp_inclusive: usize = end_cp_exclusive - 1;
+
+        // Map codepoint offsets → (row, col). Inverse of
+        // `rowColToCp`, mirroring `axSetCaretPosition` at line ~3681.
+        const start_rc = cpToRowCol(text, start_cp);
+        const end_rc = cpToRowCol(text, end_cp_inclusive);
+
+        core_surface.renderer_state.mutex.lock();
+        const screen: *terminal.Screen = core_surface.renderer_state.terminal.screens.active;
+        const cols = screen.pages.cols;
+        if (cols == 0) {
+            core_surface.renderer_state.mutex.unlock();
+            return 0;
+        }
+        const max_col: u32 = @intCast(cols - 1);
+        const start_pin = screen.pages.pin(.{ .viewport = .{
+            .x = @intCast(@min(start_rc.col, max_col)),
+            .y = start_rc.row,
+        } }) orelse {
+            core_surface.renderer_state.mutex.unlock();
+            return 0;
+        };
+        const end_pin = screen.pages.pin(.{ .viewport = .{
+            .x = @intCast(@min(end_rc.col, max_col)),
+            .y = end_rc.row,
+        } }) orelse {
+            core_surface.renderer_state.mutex.unlock();
+            return 0;
+        };
+
+        const sel = terminal.Selection.init(start_pin, end_pin, false);
+        screen.select(sel) catch |err| {
+            core_surface.renderer_state.mutex.unlock();
+            log.warn("axSetSelection: select failed err={}", .{err});
+            return 0;
+        };
+        core_surface.renderer_state.mutex.unlock();
+
+        // Trigger a repaint so the highlight becomes visible. The core
+        // surface tracks selection-dirty on the Screen; `redraw` just
+        // tells the GLArea to re-run `drawFrame`. The render pipeline
+        // reads the selection under its own mutex acquisition — our
+        // release above is what unblocks it.
+        self.redraw();
+        return 1;
+    }
+
+    /// Inverse of `rowColToCp` — map a codepoint offset into snapshot
+    /// text back to (row, col). Rows are '\n'-delimited; one codepoint
+    /// per cell (see `axRefreshCache`).
+    fn cpToRowCol(text: []const u8, cp_idx: usize) struct { row: u32, col: u32 } {
+        const byte_idx = utf8CpToByte(text, cp_idx);
+        var row: u32 = 0;
+        for (text[0..byte_idx]) |ch| {
+            if (ch == '\n') row += 1;
+        }
+        var row_start: usize = byte_idx;
+        while (row_start > 0 and text[row_start - 1] != '\n') : (row_start -= 1) {}
+        const col: u32 = @intCast(utf8CpCount(text[row_start..byte_idx]));
+        return .{ .row = row, .col = col };
+    }
+
+    /// Emit per-character SGR attributes at `offset`.
+    ///
+    /// Runs are built during `axRefreshCache` and cover contiguous
+    /// codepoint ranges sharing one `terminal.Style`. We locate the run
+    /// spanning `offset` (if any), serialize its non-default attributes
+    /// into the GTK attribute-name/value array convention, and return
+    /// the run's range so AT-SPI clients don't re-query us once per
+    /// character.
+    ///
+    /// Allocation ownership matches `get_default_attributes` (see
+    /// gtkaccessibletext.h:226): `ranges` is transfer-container (freed
+    /// with `g_free`), `attribute_names`/`attribute_values` are
+    /// zero-terminated and freed with `g_strfreev`. Output offsets are
+    /// codepoint indices per CLAUDE.md gotcha #7.
     fn axGetAttributes(
         self_opaque: *gtk.AccessibleText,
         offset: c_uint,
         n_ranges: *usize,
-        _: ?*[*]gtk.AccessibleTextRange,
-        _: ?*[*][*:0]u8,
-        _: ?*[*][*:0]u8,
+        out_ranges: ?*[*]gtk.AccessibleTextRange,
+        out_names: ?*[*][*:0]u8,
+        out_values: ?*[*][*:0]u8,
     ) callconv(.c) c_int {
-        _ = self_opaque;
-        _ = offset;
-        n_ranges.* = 0;
-        return 0; // FALSE = no attributes
+        const self: *Self = @ptrCast(@alignCast(self_opaque));
+        const priv = self.private();
+        const core_surface = priv.core_surface orelse {
+            n_ranges.* = 0;
+            return 0;
+        };
+
+        // Ensure runs are in sync with the current viewport. Cache is
+        // served from memory when populated, so this is cheap after
+        // the first call per frame.
+        _ = self.axRefreshCache() orelse {
+            n_ranges.* = 0;
+            return 0;
+        };
+
+        const runs = priv.ax_style_runs.items;
+        const run: Private.StyleRun = run: for (runs) |r| {
+            if (offset >= r.start_cp and offset < r.end_cp) break :run r;
+        } else {
+            n_ranges.* = 0;
+            return 0;
+        };
+
+        // Build `(name, value)` pairs for non-default attributes.
+        // Bounded by the distinct attribute keys we emit (11); stack
+        // buffer avoids a transient allocation.
+        var names: [16][*:0]u8 = undefined;
+        var values: [16][*:0]u8 = undefined;
+        var count: usize = 0;
+
+        const palette = &core_surface.renderer_state.terminal.colors.palette.current;
+
+        // Color helper: resolve `terminal.Style.Color` → `?RGB` against
+        // the live palette so AT clients see the color the user sees.
+        const resolveColor = struct {
+            fn f(
+                c: terminal.Style.Color,
+                pal: *const terminal.color.Palette,
+            ) ?terminal.color.RGB {
+                return switch (c) {
+                    .none => null,
+                    .palette => |idx| pal[idx],
+                    .rgb => |rgb| rgb,
+                };
+            }
+        }.f;
+
+        // Color strings live until the g_strdup below; each gets its
+        // own stack buffer because up to three may be live at once.
+        var fg_buf: [24]u8 = undefined;
+        var bg_buf: [24]u8 = undefined;
+        var ul_buf: [24]u8 = undefined;
+
+        if (resolveColor(run.style.fg_color, palette)) |rgb| {
+            const s = std.fmt.bufPrintZ(&fg_buf, "{d},{d},{d}", .{
+                rgb.r, rgb.g, rgb.b,
+            }) catch "";
+            names[count] = glib.strdup("fg-color");
+            values[count] = glib.strdup(s.ptr);
+            count += 1;
+        }
+        if (resolveColor(run.style.bg_color, palette)) |rgb| {
+            const s = std.fmt.bufPrintZ(&bg_buf, "{d},{d},{d}", .{
+                rgb.r, rgb.g, rgb.b,
+            }) catch "";
+            names[count] = glib.strdup("bg-color");
+            values[count] = glib.strdup(s.ptr);
+            count += 1;
+        }
+
+        const flags = run.style.flags;
+        if (flags.bold) {
+            names[count] = glib.strdup("weight");
+            values[count] = glib.strdup("700");
+            count += 1;
+        } else if (flags.faint) {
+            // Reported as a standard weight so AT clients that key on
+            // "weight" still see the variation. The explicit
+            // `ghostty-faint` below preserves the distinction from a
+            // configured light font weight.
+            names[count] = glib.strdup("weight");
+            values[count] = glib.strdup("300");
+            count += 1;
+        }
+        if (flags.italic) {
+            names[count] = glib.strdup("style");
+            values[count] = glib.strdup("italic");
+            count += 1;
+        }
+        switch (flags.underline) {
+            .none => {},
+            .single, .curly, .dotted, .dashed => {
+                // AT-SPI's vocabulary is none/single/double/error —
+                // curly/dotted/dashed flatten to "single" (no finer
+                // granularity is announced by Orca).
+                names[count] = glib.strdup("underline");
+                values[count] = glib.strdup("single");
+                count += 1;
+            },
+            .double => {
+                names[count] = glib.strdup("underline");
+                values[count] = glib.strdup("double");
+                count += 1;
+            },
+        }
+        if (flags.overline) {
+            names[count] = glib.strdup("overline");
+            values[count] = glib.strdup("single");
+            count += 1;
+        }
+        if (flags.strikethrough) {
+            names[count] = glib.strdup("strikethrough");
+            values[count] = glib.strdup("true");
+            count += 1;
+        }
+
+        // Non-standard flags get a `ghostty-` prefix so AT-SPI clients
+        // that don't know them won't mis-interpret them as standard
+        // attributes. Blind users running Ghostty-aware tooling can
+        // still surface them.
+        if (flags.faint) {
+            names[count] = glib.strdup("ghostty-faint");
+            values[count] = glib.strdup("true");
+            count += 1;
+        }
+        if (flags.blink) {
+            names[count] = glib.strdup("ghostty-blink");
+            values[count] = glib.strdup("true");
+            count += 1;
+        }
+        if (flags.inverse) {
+            names[count] = glib.strdup("ghostty-inverse");
+            values[count] = glib.strdup("true");
+            count += 1;
+        }
+        if (flags.invisible) {
+            names[count] = glib.strdup("ghostty-invisible");
+            values[count] = glib.strdup("true");
+            count += 1;
+        }
+        if (resolveColor(run.style.underline_color, palette)) |rgb| {
+            const s = std.fmt.bufPrintZ(&ul_buf, "{d},{d},{d}", .{
+                rgb.r, rgb.g, rgb.b,
+            }) catch "";
+            names[count] = glib.strdup("ghostty-underline-color");
+            values[count] = glib.strdup(s.ptr);
+            count += 1;
+        }
+
+        if (count == 0) {
+            n_ranges.* = 0;
+            return 0;
+        }
+
+        // Transfer ownership to the caller. `ranges` is one entry
+        // (the whole run); `names`/`values` are zero-terminated via
+        // `g_malloc0` for the trailing NULL slot.
+        if (out_ranges) |out| {
+            const rng_ptr = glib.malloc(@sizeOf(gtk.AccessibleTextRange));
+            const rng: [*]gtk.AccessibleTextRange = @ptrCast(@alignCast(rng_ptr));
+            rng[0] = .{
+                .f_start = run.start_cp,
+                .f_length = run.end_cp - run.start_cp,
+            };
+            out.* = rng;
+        }
+        const slots: usize = (count + 1) * @sizeOf(?[*:0]u8);
+        if (out_names) |n| {
+            const arr_ptr = glib.malloc0(slots);
+            const arr: [*][*:0]u8 = @ptrCast(@alignCast(arr_ptr));
+            for (names[0..count], 0..) |s, i| arr[i] = s;
+            n.* = arr;
+        } else {
+            // Caller declined the array: free the strdup'd names so
+            // they don't leak. Values are handled symmetrically below.
+            for (names[0..count]) |s| glib.free(s);
+        }
+        if (out_values) |v| {
+            const arr_ptr = glib.malloc0(slots);
+            const arr: [*][*:0]u8 = @ptrCast(@alignCast(arr_ptr));
+            for (values[0..count], 0..) |s, i| arr[i] = s;
+            v.* = arr;
+        } else {
+            for (values[0..count]) |s| glib.free(s);
+        }
+
+        n_ranges.* = 1;
+        return 1;
     }
 
     fn axGetDefaultAttributes(
@@ -3174,17 +4426,146 @@ pub const Surface = extern struct {
         attribute_names: ?*[*][*:0]u8,
         attribute_values: ?*[*][*:0]u8,
     ) callconv(.c) void {
-        _ = self_opaque;
-        // GTK expects NULL-terminated arrays (transfer full).
-        // Allocate minimal arrays with just the NULL terminator
-        // using g_malloc0 so GTK can g_strfreev them.
+        const self: *Self = @ptrCast(@alignCast(self_opaque));
+        const priv = self.private();
+
+        // No core surface yet: return single-NULL arrays so GTK's
+        // g_strfreev frees cleanly without walking into garbage.
+        const core_surface = priv.core_surface orelse {
+            if (attribute_names) |n| {
+                const ptr = glib.malloc0(@sizeOf(?[*:0]u8));
+                n.* = @ptrCast(@alignCast(ptr));
+            }
+            if (attribute_values) |v| {
+                const ptr = glib.malloc0(@sizeOf(?[*:0]u8));
+                v.* = @ptrCast(@alignCast(ptr));
+            }
+            return;
+        };
+
+        // Two attributes + NULL terminator. Arrays themselves are
+        // g_malloc0'd (zeroed tail acts as the NULL terminator) and
+        // each element is g_strdup'd so GTK's g_strfreev frees them
+        // with the matching g_free.
+        const slots = @sizeOf(?[*:0]u8) * 3;
+
         if (attribute_names) |n| {
-            const ptr = glib.malloc0(@sizeOf(?[*:0]u8));
-            n.* = @ptrCast(@alignCast(ptr));
+            const arr_ptr = glib.malloc0(slots);
+            const arr: [*][*:0]u8 = @ptrCast(@alignCast(arr_ptr));
+            arr[0] = glib.strdup("family-name");
+            arr[1] = glib.strdup("size");
+            n.* = arr;
         }
+
         if (attribute_values) |v| {
-            const ptr = glib.malloc0(@sizeOf(?[*:0]u8));
-            v.* = @ptrCast(@alignCast(ptr));
+            // First configured family. An empty list falls back to
+            // "monospace", matching the font backend's own fallback
+            // so the reported attribute stays truthful.
+            const family: [*:0]const u8 = family: {
+                const list = core_surface.config.font.@"font-family".list.items;
+                if (list.len > 0) break :family list[0].ptr;
+                break :family "monospace";
+            };
+
+            // Effective (live) size in points — tracks
+            // increase/decrease/reset_font_size so AT clients see
+            // what the user actually sees.
+            var size_buf: [32]u8 = undefined;
+            const size = std.fmt.bufPrintZ(
+                &size_buf,
+                "{d:.2}",
+                .{core_surface.font_size.points},
+            ) catch "0";
+
+            const arr_ptr = glib.malloc0(slots);
+            const arr: [*][*:0]u8 = @ptrCast(@alignCast(arr_ptr));
+            arr[0] = glib.strdup(family);
+            arr[1] = glib.strdup(size.ptr);
+            v.* = arr;
+        }
+    }
+
+    //---------------------------------------------------------------
+    // GtkAccessibleHypertext interface (GTK 4.22+)
+    //
+    // Registered conditionally in `Class.init` only when
+    // `a11y_hypertext.available` is true. Orca's AXHypertext queries
+    // these to announce "link" when the caret or flat-review cursor
+    // enters a link range. On older GTK the interface is absent and
+    // these functions are never called.
+
+    fn accessibleHypertextIfaceInit(
+        iface: *a11y_hypertext.AccessibleHypertextInterface,
+    ) callconv(.c) void {
+        iface.get_n_links = &axGetNLinks;
+        iface.get_link = &axGetLink;
+        iface.get_link_at = &axGetLinkAt;
+    }
+
+    fn axGetNLinks(
+        self_opaque: *a11y_hypertext.AccessibleHypertext,
+    ) callconv(.c) c_uint {
+        const self: *Self = @ptrCast(@alignCast(self_opaque));
+        _ = self.axRefreshCache();
+        self.ensureAxLinksWired();
+        return @intCast(self.private().ax_links.items.len);
+    }
+
+    fn axGetLink(
+        self_opaque: *a11y_hypertext.AccessibleHypertext,
+        index: c_uint,
+    ) callconv(.c) *a11y_hypertext.AccessibleHyperlink {
+        const self: *Self = @ptrCast(@alignCast(self_opaque));
+        _ = self.axRefreshCache();
+        // Critical: each hyperlink's AT context must be realized
+        // BEFORE we return it. GTK's bridge reads the D-Bus ref
+        // from the context right after this vfunc returns; an
+        // unrealized context yields an empty bus name and crashes
+        // Orca's `_atspi_dbus_return_hyperlink_from_iter` with a
+        // D-Bus assert.
+        self.ensureAxLinksWired();
+        // The contract (header: "@index must be smaller than the
+        // number of links") means callers bounds-check via
+        // `get_n_links` first. If they don't, we'd rather fail
+        // loudly than return a bogus pointer.
+        return self.private().ax_links.items[index].obj;
+    }
+
+    fn axGetLinkAt(
+        self_opaque: *a11y_hypertext.AccessibleHypertext,
+        offset: c_uint,
+    ) callconv(.c) c_uint {
+        const self: *Self = @ptrCast(@alignCast(self_opaque));
+        _ = self.axRefreshCache();
+        self.ensureAxLinksWired();
+        for (self.private().ax_links.items, 0..) |link, i| {
+            if (offset >= link.start_cp and offset < link.end_cp) {
+                return @intCast(i);
+            }
+        }
+        return std.math.maxInt(c_uint);
+    }
+
+    /// Realize each `GtkAccessibleHyperlink`'s AT context by setting
+    /// its accessible parent to the Surface. Required for
+    /// `Hypertext.GetLink` to return a valid D-Bus ref — without
+    /// this, the hyperlink context has no bus name and Orca's
+    /// `_atspi_dbus_return_hyperlink_from_iter` crashes with a
+    /// D-Bus assert (CLAUDE.md gotcha #14).
+    ///
+    /// MUST run outside `axRefreshCache`'s renderer mutex — parent
+    /// realization triggers an AT-SPI tree-change event that Orca
+    /// responds to by re-querying us, which would re-enter
+    /// `axRefreshCache` and deadlock on the mutex. All callers
+    /// post-date `axRefreshCache` (its `defer unlock` has already
+    /// fired by the time control returns). Repeat calls are cheap:
+    /// GTK's `gtk_at_context_set_accessible_parent` short-circuits
+    /// when the parent is already set.
+    fn ensureAxLinksWired(self: *Self) void {
+        const self_accessible: *gtk.Accessible = @ptrCast(@alignCast(self));
+        for (self.private().ax_links.items) |link| {
+            const link_acc: *gtk.Accessible = @ptrCast(@alignCast(link.obj));
+            link_acc.setAccessibleParent(self_accessible, null);
         }
     }
 
@@ -4553,6 +5934,15 @@ pub const Surface = extern struct {
             signals.@"present-request".impl.register(.{});
             signals.@"toggle-fullscreen".impl.register(.{});
             signals.@"toggle-maximize".impl.register(.{});
+
+            // Resolve GTK 4.22 hypertext symbols before the
+            // `implements` loop in `defineClass` calls
+            // `AccessibleHypertext.getGObjectType()` — that getter
+            // reads `syms.hypertext_get_type` populated here. On
+            // older GTK this leaves `available` false, the getter
+            // returns 0, and GObject declines to add the interface
+            // (graceful degrade).
+            a11y_hypertext.init();
 
             // Virtual methods
             gobject.Object.virtual_methods.dispose.implement(class, &dispose);
