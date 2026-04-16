@@ -262,6 +262,19 @@ pub const Application = extern struct {
         // logging system rather than just getting dumped directly to stderr.
         _ = glib.logSetWriterFunc(glibLogWriterFunction, null, null);
 
+        // Seed the program name and application name before any GTK / libadwaita
+        // initialization. The AT-SPI bridge reads `g_get_prgname()` for the
+        // application object's "Name" property (see gtkatspiroot.c:
+        // `g_variant_new_string (g_get_prgname () ? g_get_prgname () : "Unnamed")`)
+        // and `g_get_application_name()` for "Description". Without prgname,
+        // Orca and accerciser report the app as "Unnamed" and can't locate
+        // it by name. On X11, `winproto/x11.zig` may override prgname later to
+        // derive WM_CLASS — that's fine; on Wayland this stays as "Ghostty".
+        // `g_set_application_name` is one-shot, so calling it early also
+        // guarantees it wins over anything GTK would otherwise pick.
+        glib.setPrgname("Ghostty");
+        glib.setApplicationName("Ghostty");
+
         // Log our GTK versions
         gtk_version.logVersion();
         adw_version.logVersion();
@@ -390,12 +403,6 @@ pub const Application = extern struct {
             gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 3,
         );
         errdefer css_provider.unref();
-
-        // Set the application name so screen readers and window managers
-        // identify the app as "Ghostty" rather than the process name. AT-SPI
-        // otherwise reports the application as "Unnamed", and Orca can't
-        // locate it by name (see `ax_utilities_application.py`).
-        glib.setApplicationName("Ghostty");
 
         // Initialize the app.
         const self = gobject.ext.newInstance(Self, .{
