@@ -3099,14 +3099,29 @@ pub const Surface = extern struct {
             // spaces to preserve column positions. This matches what
             // `ScreenFormatter` does for non-trailing blanks.
             var blank_cells: usize = 0;
+            // Pending cursor position when the cursor lands on a blank
+            // cell: index into the current blank run where the cursor
+            // sits. Resolved to an absolute buffer offset either when
+            // the blanks flush (= `buffer.items.len + idx`, inside the
+            // about-to-be-emitted space run) or at end-of-row when the
+            // blanks get eaten as trailing (= `buffer.items.len`, i.e.
+            // end of emitted text).
+            var cursor_blank_idx: ?usize = null;
             for (0..cells.len) |col| {
+                const cell = &cells[col];
+
                 // Record cursor byte position before writing the cell at
-                // cursor.x, so the offset points AT that cell.
+                // cursor.x, so the offset points AT that cell. For blank
+                // cells we defer: capture the blank-run index and resolve
+                // on flush or end-of-row.
                 if (is_cursor_row and col == cursor.x) {
-                    cursor_offset = @intCast(buffer.items.len);
+                    if (cell.hasText()) {
+                        cursor_offset = @intCast(buffer.items.len);
+                    } else {
+                        cursor_blank_idx = blank_cells;
+                    }
                 }
 
-                const cell = &cells[col];
                 switch (cell.wide) {
                     .spacer_tail, .spacer_head => continue,
                     .narrow, .wide => {},
@@ -3131,6 +3146,13 @@ pub const Surface = extern struct {
                 // open styled run before the gap.
                 if (blank_cells > 0) {
                     closeStyle(priv, &cur_style, cp_count);
+                    // Resolve a cursor that landed inside this blank
+                    // run to its column within the about-to-be-emitted
+                    // spaces.
+                    if (cursor_blank_idx) |idx| {
+                        cursor_offset = @intCast(buffer.items.len + idx);
+                        cursor_blank_idx = null;
+                    }
                     buffer.appendNTimes(alloc, ' ', blank_cells) catch return null;
                     cp_count += @intCast(blank_cells);
                     blank_cells = 0;
@@ -3225,6 +3247,14 @@ pub const Surface = extern struct {
             // blanks, or cursor beyond row end), anchor to end-of-row.
             if (is_cursor_row and cursor.x >= cells.len) {
                 cursor_offset = @intCast(buffer.items.len);
+            }
+
+            // Cursor landed inside a blank run that never flushed —
+            // those cells are trailing and got eaten. Anchor to the
+            // end of emitted text on this row.
+            if (cursor_blank_idx != null) {
+                cursor_offset = @intCast(buffer.items.len);
+                cursor_blank_idx = null;
             }
 
             // End of row: close any open link. Links don't span '\n'
