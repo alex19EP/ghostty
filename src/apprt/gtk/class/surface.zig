@@ -757,6 +757,35 @@ pub const Surface = extern struct {
         // owns a dup'd NUL-terminated URI and a strong ref on its
         // GtkAccessibleHyperlink object.
         ax_links: std.ArrayList(AxLink) = .empty,
+        // Carries the previous-frame `ax_links` during `axRefreshCache`
+        // so `commitAxLink` can reuse unchanged hyperlinks in place
+        // instead of unparent+unref'ing every entry per frame. The
+        // churn was the proximate cause of a use-after-free: Orca
+        // queues `Hypertext.GetLink(idx)` based on an older frame's
+        // link count, and if the hyperlink at that index has been
+        // freed by the time the queued D-Bus idle dispatches, GTK's
+        // bridge SIGSEGVs inside `gtk_accessible_get_at_context`
+        // (taking Orca down with it when the faulted reply lands).
+        // Keeping unchanged entries stable means their bus paths
+        // survive across frames and queued queries resolve cleanly.
+        //
+        // Populated at the top of `axRefreshCache`, drained by
+        // `axFinalizeLinksPrev` at the bottom. Outside a refresh it
+        // must be empty (asserted on entry).
+        ax_links_prev: std.ArrayList(AxLink) = .empty,
+        // Number of `ax_links_prev` entries already moved into
+        // `ax_links` via positional-match reuse. Grows monotonically
+        // within a refresh; `axFinalizeLinksPrev` disposes
+        // `ax_links_prev.items[ax_links_prev_consumed..]` as stale.
+        ax_links_prev_consumed: usize = 0,
+        // Once `commitAxLink` hits a spec mismatch against the
+        // prev-frame slot at `ax_links.items.len`, further reuse is
+        // disabled for the remainder of the refresh. The prev tail
+        // (`ax_links_prev.items[ax_links_prev_consumed..]`) is
+        // disposed on the spot so subsequent commits don't race
+        // against it, and the flag prevents the reuse branch from
+        // re-entering.
+        ax_links_prev_frozen: bool = false,
         // Coalesced per-cell style runs describing which codepoint
         // ranges carry which `terminal.Style`. Parallel to
         // `ax_cached_text`; rebuilt in `axRefreshCache`. Gaps between
@@ -2116,9 +2145,14 @@ pub const Surface = extern struct {
         // Release any GtkAccessibleHyperlink objects and owned URIs.
         // `ax_links` uses `std.heap.c_allocator` separately from
         // `alloc` above so URIs survive across refreshes even while
-        // page memory moves.
+        // page memory moves. `ax_links_prev` is normally empty outside
+        // an active `axRefreshCache`; we still drain it in case
+        // disposal interrupted a refresh mid-flight (e.g., a panic
+        // during the cell walk left prev entries live).
         self.clearAxLinks();
         priv.ax_links.deinit(std.heap.c_allocator);
+        self.axDisposePrevTail(priv.ax_links_prev_consumed);
+        priv.ax_links_prev.deinit(std.heap.c_allocator);
         priv.ax_style_runs.deinit(std.heap.c_allocator);
 
         gobject.Object.virtual_methods.finalize.call(
@@ -3007,9 +3041,20 @@ pub const Surface = extern struct {
             priv.ax_cached_text = null;
         }
 
-        // Free link entries from the previous refresh. Always safe: on
-        // older GTK the list is always empty (track_links is false).
-        self.clearAxLinks();
+        // Move the previous refresh's links aside so `commitAxLink`
+        // can reuse them in place when specs match. Any entries that
+        // aren't reused get disposed by `axFinalizeLinksPrev`. The
+        // `defer` guarantees we finalize even on an OOM early-return
+        // from the cell walk below — otherwise prev entries would
+        // leak and the next refresh's swap assert would trip. On
+        // older GTK the list is always empty (track_links is false),
+        // so swap + finalize is a no-op.
+        std.debug.assert(priv.ax_links_prev.items.len == 0);
+        std.debug.assert(priv.ax_links_prev_consumed == 0);
+        std.debug.assert(!priv.ax_links_prev_frozen);
+        priv.ax_links_prev = priv.ax_links;
+        priv.ax_links = .empty;
+        defer self.axFinalizeLinksPrev();
         // Style runs are POD; drop them without per-item cleanup.
         priv.ax_style_runs.clearRetainingCapacity();
 
@@ -3272,7 +3317,8 @@ pub const Surface = extern struct {
         // Scan the built buffer for configured regex links (bare URLs,
         // user-configured patterns). Runs after the cell walk so that
         // OSC 8 ranges are already in `ax_links` and we can dedup
-        // overlapping regex matches against them.
+        // overlapping regex matches against them. Prev-refresh
+        // disposal happens via `defer` at the top of this function.
         if (track_links) self.axMatchRegexLinks(buffer.items, core_surface);
 
         const text = alloc.dupeZ(u8, buffer.items) catch return null;
@@ -3317,12 +3363,23 @@ pub const Surface = extern struct {
         priv.ax_links.clearRetainingCapacity();
     }
 
-    /// Record a discovered link range. Dup's the URI (which is
-    /// borrowed from page memory and only valid while the renderer
-    /// mutex is held) and constructs a GtkAccessibleHyperlink. Any
-    /// allocation failure is logged and the link is skipped rather
-    /// than surfaced — a missing link degrades to "announced as
-    /// plain text", never a crash.
+    /// Record a discovered link range. When the prev-refresh entry at
+    /// the same positional slot carries the same `(start_cp, end_cp,
+    /// uri)` spec, the existing `GtkAccessibleHyperlink` is moved over
+    /// verbatim — keeping its AT-SPI bus path live across the frame
+    /// boundary. Otherwise a fresh hyperlink is constructed and the
+    /// prev tail is disposed immediately so subsequent commits don't
+    /// race against stale entries. Any allocation failure is logged
+    /// and the link is skipped rather than surfaced — a missing link
+    /// degrades to "announced as plain text", never a crash.
+    ///
+    /// Reuse is positional (index-keyed), not content-keyed, because
+    /// `gtk_accessible_hyperlink_new`'s `index` argument is
+    /// construct-only: a hyperlink constructed with index=3 cannot be
+    /// repurposed as index=5 without a rebuild. Positional matching
+    /// handles the common case (stable link set across cursor blinks
+    /// and in-place output) and falls through to full rebuild when
+    /// links are inserted, deleted, or reordered.
     fn commitAxLink(
         self: *Self,
         start_cp: c_uint,
@@ -3333,6 +3390,43 @@ pub const Surface = extern struct {
 
         const priv = self.private();
         const alloc = std.heap.c_allocator;
+        const target_idx = priv.ax_links.items.len;
+
+        // Try to reuse the prev entry at the same slot.
+        if (!priv.ax_links_prev_frozen and
+            target_idx < priv.ax_links_prev.items.len)
+        {
+            const candidate = priv.ax_links_prev.items[target_idx];
+            if (candidate.start_cp == start_cp and
+                candidate.end_cp == end_cp and
+                std.mem.eql(u8, candidate.uri, uri))
+            {
+                if (priv.ax_links.append(alloc, candidate)) |_| {
+                    priv.ax_links_prev_consumed = target_idx + 1;
+                    return;
+                } else |err| {
+                    // Freeze + dispose the prev tail (same pattern as
+                    // the spec-mismatch branch below) so two hyperlinks
+                    // aren't live at the same index between here and
+                    // end-of-refresh. Fall through to the new-object
+                    // path for uniform logging of the allocation
+                    // failure.
+                    log.warn("ax_link append (reuse) failed: {}", .{err});
+                    priv.ax_links_prev_frozen = true;
+                    self.axDisposePrevTail(priv.ax_links_prev_consumed);
+                }
+            } else {
+                // Spec mismatch at this slot. Freeze reuse and dispose
+                // the entire prev tail now — including the mismatched
+                // entry at `target_idx` — so further commits in this
+                // refresh can't accidentally consult stale entries and
+                // so the new hyperlink we're about to create at
+                // index=target_idx isn't shadowed on the bus by the
+                // old hyperlink at the same index.
+                priv.ax_links_prev_frozen = true;
+                self.axDisposePrevTail(priv.ax_links_prev_consumed);
+            }
+        }
 
         const uri_owned = alloc.dupeZ(u8, uri) catch |err| {
             log.warn("ax_link uri dup failed: {}", .{err});
@@ -3343,7 +3437,7 @@ pub const Surface = extern struct {
             .f_start = start_cp,
             .f_length = end_cp - start_cp,
         };
-        const index: c_uint = @intCast(priv.ax_links.items.len);
+        const index: c_uint = @intCast(target_idx);
         const obj = a11y_hypertext.hyperlinkNew(
             @ptrCast(self),
             index,
@@ -3370,6 +3464,38 @@ pub const Surface = extern struct {
             obj.unref();
             return;
         };
+    }
+
+    /// Unparent, unref, and free the URI for each prev-refresh link
+    /// entry starting at `from`. Truncates `ax_links_prev` so the
+    /// disposed slots aren't revisited. Safe to call repeatedly; a
+    /// second call with the same `from` is a no-op. Unparenting before
+    /// unref is required (see `clearAxLinks` comment) to avoid an
+    /// in-flight D-Bus method landing on freed memory.
+    fn axDisposePrevTail(self: *Self, from: usize) void {
+        const priv = self.private();
+        const alloc = std.heap.c_allocator;
+        if (from >= priv.ax_links_prev.items.len) return;
+        for (priv.ax_links_prev.items[from..]) |stale| {
+            const link_acc: *gtk.Accessible = @ptrCast(@alignCast(stale.obj));
+            link_acc.setAccessibleParent(null, null);
+            stale.obj.unref();
+            alloc.free(stale.uri);
+        }
+        priv.ax_links_prev.shrinkRetainingCapacity(from);
+    }
+
+    /// End-of-refresh cleanup for `ax_links_prev`. Disposes every
+    /// entry that `commitAxLink` did not reuse (the tail past
+    /// `ax_links_prev_consumed`), then empties the list and resets
+    /// the reuse state so the next refresh starts clean. Call this
+    /// after the last `commitAxLink` invocation in a refresh cycle.
+    fn axFinalizeLinksPrev(self: *Self) void {
+        const priv = self.private();
+        self.axDisposePrevTail(priv.ax_links_prev_consumed);
+        priv.ax_links_prev.clearAndFree(std.heap.c_allocator);
+        priv.ax_links_prev_consumed = 0;
+        priv.ax_links_prev_frozen = false;
     }
 
     /// Scan the freshly-built viewport buffer for configured regex
