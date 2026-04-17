@@ -4723,17 +4723,28 @@ pub const Surface = extern struct {
     }
 
     /// Return the Surface's persistent empty-range `GtkAccessibleHyperlink`,
-    /// creating and parenting it on the first call. The sentinel has
-    /// start=end=0 and an empty URI; its sole purpose is to be a
-    /// valid AT-SPI object that the bridge can serialize when an OOB
-    /// `GetLink(idx)` query races a link-count decrease. Lifetime is
-    /// the Surface's; disposed in `finalize`.
+    /// creating and parenting it on the first call. Its sole purpose
+    /// is to be a valid AT-SPI object that the bridge can serialize
+    /// when an OOB `GetLink(idx)` query races a link-count decrease.
+    /// Lifetime is the Surface's; disposed in `finalize`.
+    ///
+    /// Bounds are set to `start = maxInt(c_uint), length = 0` so
+    /// `get_link_start_offset`/`get_link_end_offset` both report
+    /// positions past any real text. Orca's
+    /// `AXHypertext.get_all_links_in_range`
+    /// (`ax_hypertext.py:84-87`) filters with
+    /// `start_offset <= link_start < end_offset or start_offset <
+    /// link_end <= end_offset` — unreachable for UINT_MAX offsets.
+    /// Without this, a zero-bounds sentinel passes the filter on
+    /// any zone starting at 0 and Orca's `_adjust_for_links`
+    /// (`speech_presenter.py:2185`) inserts a spurious " link"
+    /// token at position 0 of that line's text.
     fn axGetLinkSentinel(self: *Self) *a11y_hypertext.AccessibleHyperlink {
         const priv = self.private();
         if (priv.ax_link_sentinel) |s| return s;
 
         var bounds: gtk.AccessibleTextRange = .{
-            .f_start = 0,
+            .f_start = std.math.maxInt(c_uint),
             .f_length = 0,
         };
         const obj = a11y_hypertext.hyperlinkNew(
