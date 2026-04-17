@@ -786,6 +786,21 @@ pub const Surface = extern struct {
         // against it, and the flag prevents the reuse branch from
         // re-entering.
         ax_links_prev_frozen: bool = false,
+        // Persistent, empty-range `GtkAccessibleHyperlink` returned
+        // from `axGetLink`/`axGetLinkAt` when Orca asks for an index
+        // past the current `ax_links.items.len`. OOB queries happen
+        // in practice because Orca queues `Hypertext.GetLink(idx)` on
+        // the D-Bus idle after a `GetNLinks` that reported a larger
+        // count; if the viewport changed (link scrolled off) before
+        // the idle dispatches, `idx` is stale. GTK's bridge does
+        // `g_variant_new("(@(so))", ref)` on our return with no
+        // null-check (`gtkatspihypertext.c:65-68`), so returning
+        // NULL or OOB-read garbage both SIGSEGV. A pre-parented
+        // sentinel with zero bounds and empty URI resolves to a
+        // valid D-Bus ref — Orca gets an inert empty link, no
+        // crash. Created lazily on first OOB hit, disposed in
+        // `finalize`.
+        ax_link_sentinel: ?*a11y_hypertext.AccessibleHyperlink = null,
         // Coalesced per-cell style runs describing which codepoint
         // ranges carry which `terminal.Style`. Parallel to
         // `ax_cached_text`; rebuilt in `axRefreshCache`. Gaps between
@@ -2153,6 +2168,12 @@ pub const Surface = extern struct {
         priv.ax_links.deinit(std.heap.c_allocator);
         self.axDisposePrevTail(priv.ax_links_prev_consumed);
         priv.ax_links_prev.deinit(std.heap.c_allocator);
+        if (priv.ax_link_sentinel) |s| {
+            const link_acc: *gtk.Accessible = @ptrCast(@alignCast(s));
+            link_acc.setAccessibleParent(null, null);
+            s.unref();
+            priv.ax_link_sentinel = null;
+        }
         priv.ax_style_runs.deinit(std.heap.c_allocator);
 
         gobject.Object.virtual_methods.finalize.call(
@@ -4680,11 +4701,55 @@ pub const Surface = extern struct {
         // Orca's `_atspi_dbus_return_hyperlink_from_iter` with a
         // D-Bus assert.
         self.ensureAxLinksWired();
-        // The contract (header: "@index must be smaller than the
-        // number of links") means callers bounds-check via
-        // `get_n_links` first. If they don't, we'd rather fail
-        // loudly than return a bogus pointer.
-        return self.private().ax_links.items[index].obj;
+        // The contract says `@index must be smaller than the number
+        // of links`, but Orca breaks it in practice: it queues
+        // `GetLink(idx)` after `GetNLinks` and by the time the idle
+        // runs the link set may have shrunk (scroll, TUI redraw).
+        // OOB read of `ax_links.items` returns garbage that GTK's
+        // bridge happily dereferences in `g_variant_new("(@(so))",
+        // ref)` with no null-check (`gtkatspihypertext.c:65-68`),
+        // SIGSEGVing inside `GTK_IS_ACCESSIBLE`. Fall back to a
+        // persistent empty-range sentinel so the D-Bus call returns
+        // a valid-but-inert ref instead.
+        const priv = self.private();
+        if (index >= priv.ax_links.items.len) {
+            log.warn(
+                "ax_link GetLink({d}) out of bounds (links={d}) — returning sentinel",
+                .{ index, priv.ax_links.items.len },
+            );
+            return self.axGetLinkSentinel();
+        }
+        return priv.ax_links.items[index].obj;
+    }
+
+    /// Return the Surface's persistent empty-range `GtkAccessibleHyperlink`,
+    /// creating and parenting it on the first call. The sentinel has
+    /// start=end=0 and an empty URI; its sole purpose is to be a
+    /// valid AT-SPI object that the bridge can serialize when an OOB
+    /// `GetLink(idx)` query races a link-count decrease. Lifetime is
+    /// the Surface's; disposed in `finalize`.
+    fn axGetLinkSentinel(self: *Self) *a11y_hypertext.AccessibleHyperlink {
+        const priv = self.private();
+        if (priv.ax_link_sentinel) |s| return s;
+
+        var bounds: gtk.AccessibleTextRange = .{
+            .f_start = 0,
+            .f_length = 0,
+        };
+        const obj = a11y_hypertext.hyperlinkNew(
+            @ptrCast(self),
+            0,
+            "",
+            &bounds,
+        );
+        // Parent it so the AT context realizes and the D-Bus path
+        // becomes available (same requirement as real hyperlinks —
+        // see `ensureAxLinksWired` / CLAUDE.md gotcha #14).
+        const link_acc: *gtk.Accessible = @ptrCast(@alignCast(obj));
+        const self_accessible: *gtk.Accessible = @ptrCast(@alignCast(self));
+        link_acc.setAccessibleParent(self_accessible, null);
+        priv.ax_link_sentinel = obj;
+        return obj;
     }
 
     fn axGetLinkAt(
