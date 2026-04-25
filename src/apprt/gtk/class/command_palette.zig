@@ -318,11 +318,13 @@ pub const CommandPalette = extern struct {
             return;
         }
 
-        // Show the dialog
+        // Show the dialog. Initial focus is set via the dialog's
+        // `focus-widget` property in the blueprint, which AdwDialog
+        // grabs at the right moment in the present sequence (after
+        // the dialog is mapped and the AT-SPI subtree is live). A
+        // manual grabFocus() here would race the present animation
+        // and Orca would miss the focus-changed event.
         priv.dialog.present(window.as(gtk.Widget));
-
-        // Focus on the search bar when opening the dialog
-        _ = priv.search.as(gtk.Widget).grabFocus();
     }
 
     /// Helper function to send a signal containing the action that should be
