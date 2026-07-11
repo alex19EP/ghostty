@@ -3158,7 +3158,7 @@ pub const Surface = extern struct {
             if (is_cursor_row) cursor_offset = row_start;
 
             const cells = pin.cells(.all);
-            const page = &pin.node.data;
+            const page = pin.node.page();
 
             // Accumulate empty cells so runs of trailing empties drop off the
             // end of the row, but intermediate gaps still get emitted as
