@@ -747,10 +747,6 @@ pub const Surface = extern struct {
         ax_last_had_selection: bool = false,
         ax_last_selection_start: c_uint = 0,
         ax_last_selection_end: c_uint = 0,
-        // Millisecond timestamp of the last change check. We rate-limit the
-        // per-frame render callback so we only scan for accessibility changes
-        // a few times per second, not every redraw.
-        ax_last_check_ms: i64 = 0,
         // OSC 8 hyperlink ranges discovered in the current viewport,
         // rebuilt alongside `ax_cached_text`. Only populated when
         // `a11y_hypertext.available` is true (GTK >= 4.22). Each entry
@@ -3046,8 +3042,8 @@ pub const Surface = extern struct {
         const core_surface = priv.core_surface orelse return null;
 
         // Lock the renderer state and read the viewport text.
-        core_surface.renderer_state.mutex.lock();
-        defer core_surface.renderer_state.mutex.unlock();
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
 
         const t: *terminal.Terminal = core_surface.renderer_state.terminal;
         const screen: *terminal.Screen = t.screens.active;
@@ -3682,8 +3678,8 @@ pub const Surface = extern struct {
         const no_sel = SelState{ .has = false, .start = 0, .end = 0 };
         const sel_state: SelState = sel_state: {
             const core_surface = priv.core_surface orelse break :sel_state no_sel;
-            core_surface.renderer_state.mutex.lock();
-            defer core_surface.renderer_state.mutex.unlock();
+            core_surface.renderer_state.mutex.lockUncancelable(global.io());
+            defer core_surface.renderer_state.mutex.unlock(global.io());
             const screen: *terminal.Screen = core_surface.renderer_state.terminal.screens.active;
             const sel = screen.selection orelse break :sel_state no_sel;
             const tl = sel.topLeft(screen);
@@ -4189,11 +4185,11 @@ pub const Surface = extern struct {
         // Take the renderer mutex afresh to read the selection. Must be
         // separate from the `axRefreshCache` lock cycle — that one has
         // already released by the time we got here.
-        core_surface.renderer_state.mutex.lock();
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
         const t: *terminal.Terminal = core_surface.renderer_state.terminal;
         const screen: *terminal.Screen = t.screens.active;
         const sel = screen.selection orelse {
-            core_surface.renderer_state.mutex.unlock();
+            core_surface.renderer_state.mutex.unlock(global.io());
             n_ranges.* = 0;
             return 0;
         };
@@ -4201,7 +4197,7 @@ pub const Surface = extern struct {
         const br = sel.bottomRight(screen);
         const tl_vp = screen.pages.pointFromPin(.viewport, tl);
         const br_vp = screen.pages.pointFromPin(.viewport, br);
-        core_surface.renderer_state.mutex.unlock();
+        core_surface.renderer_state.mutex.unlock(global.io());
 
         // Selection with at least one endpoint outside the viewport:
         // our snapshot can't represent it. Fail cleanly.
@@ -4312,9 +4308,9 @@ pub const Surface = extern struct {
 
         // Empty range → clear selection.
         if (range.f_length == 0) {
-            core_surface.renderer_state.mutex.lock();
+            core_surface.renderer_state.mutex.lockUncancelable(global.io());
             core_surface.renderer_state.terminal.screens.active.clearSelection();
-            core_surface.renderer_state.mutex.unlock();
+            core_surface.renderer_state.mutex.unlock(global.io());
             self.redraw();
             return 1;
         }
@@ -4331,11 +4327,11 @@ pub const Surface = extern struct {
         const start_rc = cpToRowCol(text, start_cp);
         const end_rc = cpToRowCol(text, end_cp_inclusive);
 
-        core_surface.renderer_state.mutex.lock();
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
         const screen: *terminal.Screen = core_surface.renderer_state.terminal.screens.active;
         const cols = screen.pages.cols;
         if (cols == 0) {
-            core_surface.renderer_state.mutex.unlock();
+            core_surface.renderer_state.mutex.unlock(global.io());
             return 0;
         }
         const max_col: u32 = @intCast(cols - 1);
@@ -4343,24 +4339,24 @@ pub const Surface = extern struct {
             .x = @intCast(@min(start_rc.col, max_col)),
             .y = start_rc.row,
         } }) orelse {
-            core_surface.renderer_state.mutex.unlock();
+            core_surface.renderer_state.mutex.unlock(global.io());
             return 0;
         };
         const end_pin = screen.pages.pin(.{ .viewport = .{
             .x = @intCast(@min(end_rc.col, max_col)),
             .y = end_rc.row,
         } }) orelse {
-            core_surface.renderer_state.mutex.unlock();
+            core_surface.renderer_state.mutex.unlock(global.io());
             return 0;
         };
 
         const sel = terminal.Selection.init(start_pin, end_pin, false);
         screen.select(sel) catch |err| {
-            core_surface.renderer_state.mutex.unlock();
+            core_surface.renderer_state.mutex.unlock(global.io());
             log.warn("axSetSelection: select failed err={}", .{err});
             return 0;
         };
-        core_surface.renderer_state.mutex.unlock();
+        core_surface.renderer_state.mutex.unlock(global.io());
 
         // Trigger a repaint so the highlight becomes visible. The core
         // surface tracks selection-dirty on the Screen; `redraw` just
