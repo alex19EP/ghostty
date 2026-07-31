@@ -10,12 +10,18 @@
 //! IMPORTANT: every offset produced here that is destined for an AT client
 //! is in UTF-8 *codepoints*, not bytes. `Result.cursor_byte` is the one
 //! exception and is explicitly named as such; convert it with
-//! `utf8CpCount` before handing it out.
+//! `a11y_offsets.utf8CpCount` before handing it out. `a11y_offsets` is the
+//! companion module that navigates the snapshot this one builds.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const terminal = @import("../terminal/main.zig");
 const terminal_hyperlink = @import("../terminal/hyperlink.zig");
+const offsets = @import("a11y_offsets.zig");
+
+// Offsets handed to AT clients are in codepoints; `a11y_offsets` owns
+// that arithmetic and the tests for it.
+const utf8CpLen = offsets.utf8CpLen;
 
 const log = std.log.scoped(.a11y_text);
 
@@ -442,33 +448,6 @@ pub fn matchRegexLinks(
             );
         }
     }
-}
-
-/// Byte length of a UTF-8 codepoint given its leading byte. Malformed
-/// continuation or overlong starts advance 1 byte so the scan always makes
-/// forward progress.
-pub fn utf8CpLen(b: u8) usize {
-    if (b < 0x80) return 1;
-    if (b < 0xC0) return 1;
-    if (b < 0xE0) return 2;
-    if (b < 0xF0) return 3;
-    return 4;
-}
-
-/// Count UTF-8 codepoints in `s`.
-pub fn utf8CpCount(s: []const u8) usize {
-    var i: usize = 0;
-    var n: usize = 0;
-    while (i < s.len) : (n += 1) i += utf8CpLen(s[i]);
-    return n;
-}
-
-/// Byte offset of the `cp_idx`-th codepoint in `s`. Clamps at `s.len`.
-pub fn utf8CpToByte(s: []const u8, cp_idx: usize) usize {
-    var i: usize = 0;
-    var c: usize = 0;
-    while (i < s.len and c < cp_idx) : (c += 1) i += utf8CpLen(s[i]);
-    return i;
 }
 
 const testing = std.testing;

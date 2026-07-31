@@ -22,6 +22,7 @@ const CoreSurface = @import("../../../Surface.zig");
 const gresource = @import("../build/gresource.zig");
 const a11y_hypertext = @import("../a11y_hypertext.zig");
 const a11y_text = @import("../../a11y_text.zig");
+const a11y_offsets = @import("../../a11y_offsets.zig");
 const ext = @import("../ext.zig");
 const gsettings = @import("../gsettings.zig");
 const gtk_key = @import("../key.zig");
@@ -2911,47 +2912,17 @@ pub const Surface = extern struct {
 
         const text = self.axRefreshCache() orelse return 0;
 
-        // AT-SPI offsets are codepoint indices. Convert to byte offsets
-        // so the scans below (newlines, column counts) operate on the
-        // actual buffer.
-        const text_cp_count: c_uint = @intCast(utf8CpCount(text));
-        const s_cp = @min(start, text_cp_count);
-        const e_cp = @min(end, text_cp_count);
-        const s_byte = utf8CpToByte(text, s_cp);
-        const e_byte = utf8CpToByte(text, e_cp);
-
         // Cell metrics from the renderer — same source of truth as the GPU
         // grid, so our rects match what's on screen.
         const cell_w: f32 = @floatFromInt(core_surface.size.cell.width);
         const cell_h: f32 = @floatFromInt(core_surface.size.cell.height);
         if (cell_w <= 0 or cell_h <= 0) return 0;
 
-        // Row index of `s_byte` within the viewport: count newlines before it.
-        var row: u32 = 0;
-        for (text[0..s_byte]) |ch| {
-            if (ch == '\n') row += 1;
-        }
+        const rect = a11y_offsets.extentsCells(text, start, end);
 
-        // Column index of `s_byte`: scan back to the last newline (or
-        // start) and count codepoints in that prefix — one codepoint per
-        // terminal cell in our dump.
-        var col_start: usize = s_byte;
-        while (col_start > 0 and text[col_start - 1] != '\n') : (col_start -= 1) {}
-        const col: u32 = @intCast(utf8CpCount(text[col_start..s_byte]));
-
-        // Width in cells: codepoints from `s_byte` to the first newline
-        // (or `e_byte`), whichever comes first.
-        var width_cols: u32 = 0;
-        var i_byte: usize = s_byte;
-        while (i_byte < e_byte and text[i_byte] != '\n') {
-            i_byte += utf8CpLen(text[i_byte]);
-            width_cols += 1;
-        }
-        if (width_cols == 0) width_cols = 1;
-
-        extents.f_origin.f_x = @as(f32, @floatFromInt(col)) * cell_w;
-        extents.f_origin.f_y = @as(f32, @floatFromInt(row)) * cell_h;
-        extents.f_size.f_width = @as(f32, @floatFromInt(width_cols)) * cell_w;
+        extents.f_origin.f_x = @as(f32, @floatFromInt(rect.col)) * cell_w;
+        extents.f_origin.f_y = @as(f32, @floatFromInt(rect.row)) * cell_h;
+        extents.f_size.f_width = @as(f32, @floatFromInt(rect.width_cols)) * cell_w;
         extents.f_size.f_height = cell_h;
         return 1;
     }
@@ -2987,57 +2958,13 @@ pub const Surface = extern struct {
             return 0;
         }
 
-        // Clamp negatives and non-finite inputs to 0 so `@intFromFloat`
-        // stays in range. An upper cap protects against absurd float
-        // inputs; the text-length clamps below handle the real bound.
-        const max_cells: f32 = 1_000_000;
-        const row_f = point.f_y / cell_h;
-        const col_f = point.f_x / cell_w;
-        const row_clamped: f32 = if (std.math.isFinite(row_f))
-            @max(0, @min(row_f, max_cells))
-        else
-            0;
-        const col_clamped: f32 = if (std.math.isFinite(col_f))
-            @max(0, @min(col_f, max_cells))
-        else
-            0;
-        const want_row: u32 = @intFromFloat(row_clamped);
-        var col: u32 = @intFromFloat(col_clamped);
-
-        // Single-pass scan: find the byte offset where row `want_row`
-        // begins. If the point is past the last row, fall back to the
-        // start of whatever the last row in the buffer is.
-        var row_start: usize = 0;
-        var last_row_start: usize = 0;
-        var seen_newlines: u32 = 0;
-        var i: usize = 0;
-        while (i < text.len) : (i += 1) {
-            if (text[i] == '\n') {
-                seen_newlines += 1;
-                last_row_start = i + 1;
-                if (seen_newlines == want_row) {
-                    row_start = i + 1;
-                    break;
-                }
-            }
-        }
-        if (seen_newlines < want_row) row_start = last_row_start;
-
-        // Measure the codepoint length of the row and clamp the
-        // requested column to it.
-        var row_end: usize = row_start;
-        var row_cp_count: u32 = 0;
-        while (row_end < text.len and text[row_end] != '\n') {
-            row_end += utf8CpLen(text[row_end]);
-            row_cp_count += 1;
-        }
-        if (col > row_cp_count) col = row_cp_count;
-
-        // Advance `col` codepoints into the row. `row_start` and
-        // `row_end` are codepoint-aligned by construction, so the
-        // slice is safe to walk.
-        const byte_offset = row_start + utf8CpToByte(text[row_start..row_end], col);
-        out_offset.* = @intCast(utf8CpCount(text[0..byte_offset]));
+        const grid = a11y_offsets.pointToGrid(
+            point.f_x,
+            point.f_y,
+            cell_w,
+            cell_h,
+        );
+        out_offset.* = a11y_offsets.offsetAtGrid(text, grid.row, grid.col);
         return 1;
     }
 
@@ -3569,62 +3496,9 @@ pub const Surface = extern struct {
     /// Prefix/suffix diff: bytes `[0..p)` and `[len-s..)` are unchanged, the
     /// rest was replaced. `p` and `old.len - s` are guaranteed to land on
     /// UTF-8 codepoint boundaries in `old`.
-    const PrefixSuffixDiff = struct {
-        p: usize,
-        s: usize,
-    };
-
-    /// Compute the byte-wise common prefix and suffix of `old` and `new`,
-    /// then pull both offsets back to UTF-8 codepoint boundaries.
-    ///
-    /// Alignment matters because two multi-byte codepoints can share a
-    /// leading byte (e.g. `│` and `├`, both starting with 0xE2 0x94), and
-    /// a byte-wise compare can land inside a character. Handing an orphan
-    /// continuation byte to GTK's AT-SPI bridge makes `g_variant_new_string`
-    /// return NULL, which SIGSEGVs inside `g_variant_builder_add_value`.
-    fn axComputePrefixSuffix(old_text: []const u8, new_text: []const u8) PrefixSuffixDiff {
-        var p: usize = 0;
-        const min_len = @min(old_text.len, new_text.len);
-        while (p < min_len and old_text[p] == new_text[p]) : (p += 1) {}
-
-        // Cap the suffix so it can't overlap the prefix (that would make
-        // the remove/insert ranges go negative).
-        var s: usize = 0;
-        const max_s = @min(old_text.len - p, new_text.len - p);
-        while (s < max_s and
-            old_text[old_text.len - 1 - s] == new_text[new_text.len - 1 - s]) : (s += 1)
-        {}
-
-        // The `p < old_text.len` guard matters when `old_text` is a prefix
-        // of `new_text`: `p == old_text.len` and indexing would go out of
-        // bounds, but end-of-buffer is already a codepoint boundary.
-        while (p > 0 and p < old_text.len and (old_text[p] & 0xC0) == 0x80) : (p -= 1) {}
-        while (s > 0 and (old_text[old_text.len - s] & 0xC0) == 0x80) : (s -= 1) {}
-
-        return .{ .p = p, .s = s };
-    }
-
-    /// Look for a whole-line scroll up: a K > 0 at a `\n` boundary of
-    /// `old` such that `new[0..|old|-K] == old[K..]`. Returns 0 if no
-    /// such K exists. Since `\n` is ASCII, every candidate K is already
-    /// a UTF-8 codepoint boundary.
-    fn axComputeScrollK(old_text: []const u8, new_text: []const u8) usize {
-        if (old_text.len == 0) return 0;
-        var i: usize = 0;
-        while (i < old_text.len) : (i += 1) {
-            if (old_text[i] != '\n') continue;
-            const boundary = i + 1;
-            const remainder = old_text.len - boundary;
-            // A zero-byte remainder matches trivially at every trailing
-            // `\n` and would mask the prefix/suffix diff for every change
-            // where old_text ends in `\n`. Require a non-trivial middle.
-            if (remainder == 0 or remainder > new_text.len) continue;
-            if (std.mem.eql(u8, new_text[0..remainder], old_text[boundary..])) {
-                return boundary;
-            }
-        }
-        return 0;
-    }
+    const PrefixSuffixDiff = a11y_offsets.PrefixSuffixDiff;
+    const axComputePrefixSuffix = a11y_offsets.prefixSuffix;
+    const axComputeScrollK = a11y_offsets.scrollK;
 
     /// Pick between a prefix/suffix diff and a line-shift scroll diff based
     /// on which emits fewer bytes, and fire the corresponding AT-SPI events.
@@ -3786,15 +3660,9 @@ pub const Surface = extern struct {
             return glib.Bytes.new(buf.ptr, slice.len + 1);
         }
 
-        // Walk the slice to find the first invalid byte and log context
-        // around it (16 bytes each side, hex) so the source is identifiable.
-        var bad: usize = 0;
-        while (bad < slice.len) {
-            const len = utf8CpLen(slice[bad]);
-            if (bad + len > slice.len) break;
-            if (!std.unicode.utf8ValidateSlice(slice[bad..][0..len])) break;
-            bad += len;
-        }
+        // Log the first invalid byte with context around it (16 bytes each
+        // side, hex) so the source is identifiable.
+        const bad = a11y_offsets.firstInvalidUtf8(slice) orelse slice.len;
         const ctx_start = bad -| 16;
         const ctx_end = @min(slice.len, bad + 16);
         var hex_buf: [64 * 3]u8 = undefined;
@@ -3811,11 +3679,12 @@ pub const Surface = extern struct {
     }
 
     // UTF-8 codepoint offset helpers. Every offset we hand to AT-SPI is
-    // in codepoints, never bytes; these live in `a11y_text` so the walk
-    // and the benchmark share one implementation.
-    const utf8CpLen = a11y_text.utf8CpLen;
-    const utf8CpCount = a11y_text.utf8CpCount;
-    const utf8CpToByte = a11y_text.utf8CpToByte;
+    // in codepoints, never bytes; `a11y_offsets` owns that arithmetic and
+    // the tests that pin it down.
+    const utf8CpLen = a11y_offsets.utf8CpLen;
+    const utf8CpCount = a11y_offsets.utf8CpCount;
+    const utf8CpToByte = a11y_offsets.utf8CpToByte;
+    const rowColToCp = a11y_offsets.rowColToCp;
 
     fn axGetContentsAt(
         self_opaque: *gtk.AccessibleText,
@@ -3831,50 +3700,28 @@ pub const Surface = extern struct {
             return axEmptyBytes();
         };
 
-        // `offset` arrives from GTK as a codepoint index. All boundary
-        // scanning runs on bytes (fast, simple), and we convert back to
-        // codepoint indices before handing anything back to the caller.
-        const text_cp_count: c_uint = @intCast(utf8CpCount(text));
-        const off_cp = @min(offset, text_cp_count);
-        const off_byte = utf8CpToByte(text, off_cp);
-
-        switch (granularity) {
-            .character => {
-                if (off_cp >= text_cp_count) {
-                    out_start.* = text_cp_count;
-                    out_end.* = text_cp_count;
-                    return axEmptyBytes();
-                }
-                const end_byte = off_byte + utf8CpLen(text[off_byte]);
-                out_start.* = off_cp;
-                out_end.* = off_cp + 1;
-                return axBytesNulTerm(text[off_byte..end_byte]);
-            },
-            .word => {
-                var ws_byte: usize = off_byte;
-                while (ws_byte > 0 and text[ws_byte - 1] != ' ' and text[ws_byte - 1] != '\n') : (ws_byte -= 1) {}
-                var we_byte: usize = off_byte;
-                while (we_byte < text.len and text[we_byte] != ' ' and text[we_byte] != '\n') : (we_byte += 1) {}
-                out_start.* = @intCast(utf8CpCount(text[0..ws_byte]));
-                out_end.* = @intCast(utf8CpCount(text[0..we_byte]));
-                return axBytesNulTerm(text[ws_byte..we_byte]);
-            },
-            .line, .paragraph, .sentence => {
-                var ls_byte: usize = off_byte;
-                while (ls_byte > 0 and text[ls_byte - 1] != '\n') : (ls_byte -= 1) {}
-                var le_byte: usize = off_byte;
-                while (le_byte < text.len and text[le_byte] != '\n') : (le_byte += 1) {}
-                if (le_byte < text.len) le_byte += 1; // include the newline
-                out_start.* = @intCast(utf8CpCount(text[0..ls_byte]));
-                out_end.* = @intCast(utf8CpCount(text[0..le_byte]));
-                return axBytesNulTerm(text[ls_byte..le_byte]);
-            },
+        // Map GTK's granularity onto ours. A terminal has no sentences or
+        // paragraphs distinct from its visual rows, so both fold into
+        // `.line`. Unknown values (the non-exhaustive `_`) get an empty
+        // range at the requested offset.
+        const g: a11y_offsets.Granularity = switch (granularity) {
+            .character => .character,
+            .word => .word,
+            .line, .paragraph, .sentence => .line,
             _ => {
+                const text_cp_count: c_uint = @intCast(utf8CpCount(text));
+                const off_cp = @min(offset, text_cp_count);
                 out_start.* = off_cp;
                 out_end.* = off_cp;
                 return axEmptyBytes();
             },
-        }
+        };
+
+        const contents = a11y_offsets.contentsAt(text, offset, g);
+        out_start.* = contents.start_cp;
+        out_end.* = contents.end_cp;
+        if (contents.bytes.len == 0) return axEmptyBytes();
+        return axBytesNulTerm(contents.bytes);
     }
 
     fn axGetCaretPosition(
@@ -4067,35 +3914,6 @@ pub const Surface = extern struct {
         }
         n_ranges.* = 1;
         return 1;
-    }
-
-    /// Map (row, col) in the snapshot to a codepoint offset. Returns null
-    /// when `row` is past the last row in `text`.
-    fn rowColToCp(text: []const u8, row: u32, col: u32) ?usize {
-        var seen_nl: u32 = 0;
-        var row_start: usize = 0;
-        if (row > 0) {
-            var i: usize = 0;
-            while (i < text.len) : (i += 1) {
-                if (text[i] == '\n') {
-                    seen_nl += 1;
-                    if (seen_nl == row) {
-                        row_start = i + 1;
-                        break;
-                    }
-                }
-            }
-            if (seen_nl < row) return null;
-        }
-        var row_end: usize = row_start;
-        var row_cp: u32 = 0;
-        while (row_end < text.len and text[row_end] != '\n') {
-            row_end += utf8CpLen(text[row_end]);
-            row_cp += 1;
-        }
-        const clamped_col: u32 = @min(col, row_cp);
-        const row_prefix_cp = utf8CpCount(text[0..row_start]);
-        return row_prefix_cp + clamped_col;
     }
 
     /// GTK 4.22 `GtkAccessibleText.set_selection` vfunc. Dispatched only

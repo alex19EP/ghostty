@@ -67,4 +67,5 @@ test {
     _ = action;
     _ = structs;
     _ = @import("apprt/a11y_text.zig");
+    _ = @import("apprt/a11y_offsets.zig");
 }
