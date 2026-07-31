@@ -53,7 +53,7 @@ pub const Surface = extern struct {
         gtk.Scrollable,
         gtk.Accessible,
         gtk.AccessibleText,
-        a11y_hypertext.AccessibleHypertext,
+        a11y_hypertext.AccessibleHypertextImpl,
     };
     pub const getGObjectType = gobject.ext.defineClass(Self, .{
         .name = "GhosttySurface",
@@ -82,7 +82,7 @@ pub const Surface = extern struct {
             // GTK `getGObjectType()` returns 0 and GObject simply
             // declines to add the interface — graceful degrade to
             // no link announcement.
-            gobject.ext.implement(a11y_hypertext.AccessibleHypertext, .{
+            gobject.ext.implement(a11y_hypertext.AccessibleHypertextImpl, .{
                 .init = &accessibleHypertextIfaceInit,
             }),
         },
@@ -4292,9 +4292,9 @@ pub const Surface = extern struct {
     fn accessibleHypertextIfaceInit(
         iface: *a11y_hypertext.AccessibleHypertextInterface,
     ) callconv(.c) void {
-        iface.get_n_links = &axGetNLinks;
-        iface.get_link = &axGetLink;
-        iface.get_link_at = &axGetLinkAt;
+        iface.f_get_n_links = &axGetNLinks;
+        iface.f_get_link = &axGetLink;
+        iface.f_get_link_at = &axGetLinkAt;
     }
 
     fn axGetNLinks(
