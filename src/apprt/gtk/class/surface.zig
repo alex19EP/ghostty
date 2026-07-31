@@ -18,10 +18,10 @@ const input = @import("../../../input.zig");
 const internal_os = @import("../../../os/main.zig");
 const renderer = @import("../../../renderer.zig");
 const terminal = @import("../../../terminal/main.zig");
-const terminal_hyperlink = @import("../../../terminal/hyperlink.zig");
 const CoreSurface = @import("../../../Surface.zig");
 const gresource = @import("../build/gresource.zig");
 const a11y_hypertext = @import("../a11y_hypertext.zig");
+const a11y_text = @import("../../a11y_text.zig");
 const ext = @import("../ext.zig");
 const gsettings = @import("../gsettings.zig");
 const gtk_key = @import("../key.zig");
@@ -747,6 +747,22 @@ pub const Surface = extern struct {
         ax_last_had_selection: bool = false,
         ax_last_selection_start: c_uint = 0,
         ax_last_selection_end: c_uint = 0,
+        // Set on every rendered frame; cleared whenever we confirm the
+        // cache still matches the viewport. Because the per-frame notify
+        // is focus-gated, an unfocused surface has nothing else that would
+        // invalidate `ax_cached_text` — this makes the next on-demand AT
+        // read rebuild once instead of serving a frozen snapshot.
+        ax_cache_stale: bool = false,
+        // Scratch buffer for `axProbeChanged`. Retained across frames so
+        // the per-frame change probe doesn't allocate; only ever grows to
+        // the size of one viewport's text.
+        ax_probe_buf: std.ArrayList(u8) = .empty,
+        // Raw (viewport row/col) selection bounds seen by the last probe.
+        // This is the probe's edge-detector for selection changes; it is
+        // deliberately separate from `ax_last_selection_*`, which hold the
+        // codepoint offsets we last *notified*. Comparing raw coordinates
+        // avoids converting offsets on frames where nothing changed.
+        ax_last_sel_raw: ?SelRaw = null,
         // OSC 8 hyperlink ranges discovered in the current viewport,
         // rebuilt alongside `ax_cached_text`. Only populated when
         // `a11y_hypertext.available` is true (GTK >= 4.22). Each entry
@@ -754,7 +770,7 @@ pub const Surface = extern struct {
         // GtkAccessibleHyperlink object.
         ax_links: std.ArrayList(AxLink) = .empty,
         // Carries the previous-frame `ax_links` during `axRefreshCache`
-        // so `commitAxLink` can reuse unchanged hyperlinks in place
+        // so `commitLink` can reuse unchanged hyperlinks in place
         // instead of unparent+unref'ing every entry per frame. The
         // churn was the proximate cause of a use-after-free: Orca
         // queues `Hypertext.GetLink(idx)` based on an older frame's
@@ -774,7 +790,7 @@ pub const Surface = extern struct {
         // within a refresh; `axFinalizeLinksPrev` disposes
         // `ax_links_prev.items[ax_links_prev_consumed..]` as stale.
         ax_links_prev_consumed: usize = 0,
-        // Once `commitAxLink` hits a spec mismatch against the
+        // Once `commitLink` hits a spec mismatch against the
         // prev-frame slot at `ax_links.items.len`, further reuse is
         // disabled for the remainder of the refresh. The prev tail
         // (`ax_links_prev.items[ax_links_prev_consumed..]`) is
@@ -873,6 +889,17 @@ pub const Surface = extern struct {
             start_cp: c_uint,
             end_cp: c_uint,
             style: terminal.Style,
+        };
+
+        /// Selection bounds in raw viewport row/column, as read by
+        /// `axProbeChanged`. Cheap to capture and compare — no codepoint
+        /// conversion — so the probe can detect a selection change without
+        /// building anything.
+        pub const SelRaw = struct {
+            tl_y: u32,
+            tl_x: u32,
+            br_y: u32,
+            br_x: u32,
         };
 
         pub var offset: c_int = 0;
@@ -2171,6 +2198,7 @@ pub const Surface = extern struct {
             priv.ax_link_sentinel = null;
         }
         priv.ax_style_runs.deinit(std.heap.c_allocator);
+        priv.ax_probe_buf.deinit(std.heap.c_allocator);
 
         gobject.Object.virtual_methods.finalize.call(
             Class.parent,
@@ -3030,25 +3058,28 @@ pub const Surface = extern struct {
         // Mark that an AT client is actively querying us.
         priv.ax_active = true;
 
-        // Serve the existing cache if it's populated. The cache is rebuilt
-        // and re-published on every render frame via `axNotifyIfChanged`,
-        // so this path only does the initial build. Using a time-based TTL
-        // here would let the cache refresh mid-read (e.g. between
+        // A frame rendered since this cache was built and nothing has
+        // since confirmed it still matches, so drop it. On a focused
+        // surface `axNotifyIfChanged` normally clears the mark (or does
+        // the rebuild itself) before any AT client gets here; this path
+        // is what keeps an unfocused surface's on-demand reads fresh.
+        if (priv.ax_cache_stale) {
+            if (priv.ax_cached_text) |old| {
+                std.heap.c_allocator.free(old);
+                priv.ax_cached_text = null;
+            }
+            priv.ax_cache_stale = false;
+        }
+
+        // Serve the existing cache if it's populated. Rebuilding is tied
+        // to frame boundaries rather than a time-based TTL: a TTL would
+        // let the cache refresh mid-read (e.g. between
         // `get_character_count` and `iter_line` during an Orca flat review
         // pass), silently shifting offsets under the client and causing
         // lines past the first "short" snapshot length to disappear.
         if (priv.ax_cached_text != null) return priv.ax_cached_text;
 
         const core_surface = priv.core_surface orelse return null;
-
-        // Lock the renderer state and read the viewport text.
-        core_surface.renderer_state.mutex.lockUncancelable(global.io());
-        defer core_surface.renderer_state.mutex.unlock(global.io());
-
-        const t: *terminal.Terminal = core_surface.renderer_state.terminal;
-        const screen: *terminal.Screen = t.screens.active;
-        const pages = &screen.pages;
-        const viewport_rows: usize = pages.rows;
 
         const alloc = std.heap.c_allocator;
 
@@ -3058,11 +3089,11 @@ pub const Surface = extern struct {
             priv.ax_cached_text = null;
         }
 
-        // Move the previous refresh's links aside so `commitAxLink`
+        // Move the previous refresh's links aside so `commitLink`
         // can reuse them in place when specs match. Any entries that
         // aren't reused get disposed by `axFinalizeLinksPrev`. The
         // `defer` guarantees we finalize even on an OOM early-return
-        // from the cell walk below — otherwise prev entries would
+        // from the walk below — otherwise prev entries would
         // leak and the next refresh's swap assert would trip. On
         // older GTK the list is always empty (track_links is false),
         // so swap + finalize is a no-op.
@@ -3078,273 +3109,61 @@ pub const Surface = extern struct {
         var buffer: std.ArrayList(u8) = .empty;
         defer buffer.deinit(alloc);
 
-        const cursor = screen.cursor;
-        var cursor_offset: ?c_uint = null;
-
-        // Codepoint counter tracked alongside `buffer.items.len`. Used
-        // to populate `ax_links` with AT-SPI-compliant codepoint
-        // offsets (see CLAUDE.md gotcha #7). Separate from the byte
-        // `cursor_offset` above, which is converted once at the end.
-        var cp_count: c_uint = 0;
-
         // Whether to collect OSC 8 link ranges this refresh. Skipped on
         // older GTK where the Hypertext interface isn't registered.
         const track_links = a11y_hypertext.available;
 
-        // Currently-open run inside a single row. Closed and recorded
-        // into ax_links at the end of the row, on link-id transition,
-        // or on an interrupting blank cell. `uri` is a slice borrowed
-        // from `page.memory`; it must be dup'd before the renderer
-        // mutex is released.
-        var cur_link: ?struct {
-            id: terminal_hyperlink.Id,
-            start_cp: c_uint,
-            uri: []const u8,
-        } = null;
+        // Walk the viewport under the renderer mutex. We're the sink:
+        // `commitLink` and `commitStyleRun` receive the ranges it
+        // discovers. The lock is released the moment the walk is done —
+        // everything after this point reads `buffer`, which is our own
+        // memory, not live page memory.
+        const result = result: {
+            core_surface.renderer_state.mutex.lockUncancelable(global.io());
+            defer core_surface.renderer_state.mutex.unlock(global.io());
 
-        // Currently-open non-default style run. Closed and emitted
-        // into `ax_style_runs` at any boundary where the next
-        // emitted codepoint's style differs (different styled cell,
-        // blank-cell gap, `\n`, EOF). Coalesces identical adjacent
-        // cells into a single run — a viewport of mostly-default
-        // text collapses to zero runs and a fully-styled viewport
-        // collapses to roughly one run per contiguous SGR region
-        // per row (typical case: tens per viewport, not per cell).
-        const OpenRun = struct {
-            start_cp: c_uint,
-            style: terminal.Style,
-        };
-        var cur_style: ?OpenRun = null;
-        const closeStyle = struct {
-            fn f(
-                priv_inner: *Private,
-                cur: *?OpenRun,
-                end_cp: c_uint,
-            ) void {
-                const cs = cur.* orelse return;
-                if (end_cp > cs.start_cp) {
-                    priv_inner.ax_style_runs.append(
-                        std.heap.c_allocator,
-                        .{
-                            .start_cp = cs.start_cp,
-                            .end_cp = end_cp,
-                            .style = cs.style,
-                        },
-                    ) catch {};
-                }
-                cur.* = null;
-            }
-        }.f;
+            const screen: *terminal.Screen =
+                core_surface.renderer_state.terminal.screens.active;
 
-        const tl_pin = pages.getTopLeft(.viewport);
-        var row_it = tl_pin.rowIterator(.right_down, null);
-        var row_idx: usize = 0;
-        while (row_idx < viewport_rows) : (row_idx += 1) {
-            if (row_idx > 0) {
-                // `\n` is a default-styled gap — close any open run
-                // before advancing `cp_count` past it.
-                closeStyle(priv, &cur_style, cp_count);
-                buffer.append(alloc, '\n') catch return null;
-                cp_count += 1;
-            }
-
-            const pin = row_it.next() orelse continue;
-            const is_cursor_row = row_idx == cursor.y;
-            const row_start: c_uint = @intCast(buffer.items.len);
-            if (is_cursor_row) cursor_offset = row_start;
-
-            const cells = pin.cells(.all);
-            const page = pin.node.page();
-
-            // Accumulate empty cells so runs of trailing empties drop off the
-            // end of the row, but intermediate gaps still get emitted as
-            // spaces to preserve column positions. This matches what
-            // `ScreenFormatter` does for non-trailing blanks.
-            var blank_cells: usize = 0;
-            // Pending cursor position when the cursor lands on a blank
-            // cell: index into the current blank run where the cursor
-            // sits. Resolved to an absolute buffer offset either when
-            // the blanks flush (= `buffer.items.len + idx`, inside the
-            // about-to-be-emitted space run) or at end-of-row when the
-            // blanks get eaten as trailing (= `buffer.items.len`, i.e.
-            // end of emitted text).
-            var cursor_blank_idx: ?usize = null;
-            for (0..cells.len) |col| {
-                const cell = &cells[col];
-
-                // Record cursor byte position before writing the cell at
-                // cursor.x, so the offset points AT that cell. For blank
-                // cells we defer: capture the blank-run index and resolve
-                // on flush or end-of-row.
-                if (is_cursor_row and col == cursor.x) {
-                    if (cell.hasText()) {
-                        cursor_offset = @intCast(buffer.items.len);
-                    } else {
-                        cursor_blank_idx = blank_cells;
-                    }
-                }
-
-                switch (cell.wide) {
-                    .spacer_tail, .spacer_head => continue,
-                    .narrow, .wide => {},
-                }
-
-                if (!cell.hasText()) {
-                    blank_cells += 1;
-                    // A blank interrupts any open link run — the same
-                    // OSC 8 escape can bridge whitespace visually, but
-                    // splitting runs on blanks gives Orca a cleaner
-                    // per-word announcement and matches how a sighted
-                    // user perceives the link region.
-                    if (track_links) if (cur_link) |cl| {
-                        self.commitAxLink(cl.start_cp, cp_count, cl.uri);
-                        cur_link = null;
-                    };
-                    continue;
-                }
-
-                // Flush accumulated blanks as spaces. Each space is one
-                // codepoint and carries the default style; close any
-                // open styled run before the gap.
-                if (blank_cells > 0) {
-                    closeStyle(priv, &cur_style, cp_count);
-                    // Resolve a cursor that landed inside this blank
-                    // run to its column within the about-to-be-emitted
-                    // spaces.
-                    if (cursor_blank_idx) |idx| {
-                        cursor_offset = @intCast(buffer.items.len + idx);
-                        cursor_blank_idx = null;
-                    }
-                    buffer.appendNTimes(alloc, ' ', blank_cells) catch return null;
-                    cp_count += @intCast(blank_cells);
-                    blank_cells = 0;
-                }
-
-                // Resolve this cell's style from its page. Cells that
-                // took the `!hasText()` branch above are never seen
-                // here, so content_tag is codepoint / codepoint_grapheme;
-                // `hasStyling()` is the default_id gate (0 → default).
-                const cell_style: terminal.Style = if (cell.hasStyling())
-                    page.styles.get(page.memory, cell.style_id).*
-                else
-                    .{};
-
-                // Transition the style run: continue if identical to
-                // the open run, otherwise close and (if non-default)
-                // open a new one at the current cp_count.
-                const cell_default = cell_style.default();
-                if (cur_style) |cs| {
-                    if (!cs.style.eql(cell_style)) {
-                        closeStyle(priv, &cur_style, cp_count);
-                        if (!cell_default) cur_style = .{
-                            .start_cp = cp_count,
-                            .style = cell_style,
-                        };
-                    }
-                } else if (!cell_default) {
-                    cur_style = .{
-                        .start_cp = cp_count,
-                        .style = cell_style,
-                    };
-                }
-
-                // Determine the link on this cell BEFORE writing, so a
-                // new run's start_cp matches where this cell's
-                // codepoints land in the buffer.
-                var cell_link: ?struct {
-                    id: terminal_hyperlink.Id,
-                    uri: []const u8,
-                } = null;
-                if (track_links and cell.hyperlink) {
-                    if (page.lookupHyperlink(cell)) |lid| {
-                        const entry = page.hyperlink_set.get(page.memory, lid);
-                        cell_link = .{
-                            .id = lid,
-                            .uri = entry.uri.slice(page.memory),
-                        };
-                    }
-                }
-
-                // Transition: close current run if the link changed or
-                // ended. Link ids are unique only within a page, but
-                // rows don't straddle pages and we also close on row
-                // boundaries, so same-id across cells within a row is
-                // a valid continuity check.
-                if (cur_link) |cl| {
-                    const continues = if (cell_link) |nl| nl.id == cl.id else false;
-                    if (!continues) {
-                        self.commitAxLink(cl.start_cp, cp_count, cl.uri);
-                        cur_link = null;
-                    }
-                }
-                if (cur_link == null) {
-                    if (cell_link) |nl| cur_link = .{
-                        .id = nl.id,
-                        .start_cp = cp_count,
-                        .uri = nl.uri,
-                    };
-                }
-
-                var ubuf: [4]u8 = undefined;
-                const n = std.unicode.utf8Encode(cell.codepoint(), &ubuf) catch {
-                    buffer.append(alloc, '?') catch return null;
-                    cp_count += 1;
-                    continue;
-                };
-                buffer.appendSlice(alloc, ubuf[0..n]) catch return null;
-                cp_count += 1;
-
-                if (cell.hasGrapheme()) {
-                    if (pin.grapheme(cell)) |graphemes| {
-                        for (graphemes) |cp| {
-                            const gn = std.unicode.utf8Encode(cp, &ubuf) catch continue;
-                            buffer.appendSlice(alloc, ubuf[0..gn]) catch return null;
-                            cp_count += 1;
-                        }
-                    }
-                }
-            }
-
-            // If cursor.x is past the last column we emitted (trailing
-            // blanks, or cursor beyond row end), anchor to end-of-row.
-            if (is_cursor_row and cursor.x >= cells.len) {
-                cursor_offset = @intCast(buffer.items.len);
-            }
-
-            // Cursor landed inside a blank run that never flushed —
-            // those cells are trailing and got eaten. Anchor to the
-            // end of emitted text on this row.
-            if (cursor_blank_idx != null) {
-                cursor_offset = @intCast(buffer.items.len);
-                cursor_blank_idx = null;
-            }
-
-            // End of row: close any open link. Links don't span '\n'
-            // in the accessibility view — each visual line becomes its
-            // own navigable Hyperlink.
-            if (track_links) if (cur_link) |cl| {
-                self.commitAxLink(cl.start_cp, cp_count, cl.uri);
-                cur_link = null;
+            break :result a11y_text.build(
+                alloc,
+                &buffer,
+                screen,
+                self,
+                .{ .track_links = track_links },
+            ) catch |err| {
+                log.warn("ax text build failed: {}", .{err});
+                return null;
             };
-        }
-
-        // Close any style run still open at end-of-viewport.
-        closeStyle(priv, &cur_style, cp_count);
+        };
 
         // Scan the built buffer for configured regex links (bare URLs,
         // user-configured patterns). Runs after the cell walk so that
         // OSC 8 ranges are already in `ax_links` and we can dedup
         // overlapping regex matches against them. Prev-refresh
         // disposal happens via `defer` at the top of this function.
-        if (track_links) self.axMatchRegexLinks(buffer.items, core_surface);
+        //
+        // Deliberately outside the renderer mutex. It touches only
+        // `buffer` and the `oni.Regex` objects in the derived config —
+        // and the mutex never protected those anyway, since
+        // `Surface.changeConfig` swaps the config without taking it.
+        // What keeps them alive is that both the swap and this callback
+        // run on the GTK main thread. Holding the lock across the regex
+        // pass would cost the IO thread ~10x the walk itself on a large
+        // viewport for no safety benefit.
+        if (track_links) a11y_text.matchRegexLinks(
+            buffer.items,
+            core_surface.config.links,
+            self,
+        );
 
         const text = alloc.dupeZ(u8, buffer.items) catch return null;
         priv.ax_cached_text = text;
 
         // Caret offset exposed to AT-SPI is in UTF-8 codepoint units; our
-        // `cursor_offset` is a byte position in `text`. Convert it before
+        // `cursor_byte` is a byte position in `text`. Convert it before
         // caching. If the cursor row isn't in the viewport, anchor at end.
-        const cursor_byte = cursor_offset orelse @as(c_uint, @intCast(text.len));
+        const cursor_byte = result.cursor_byte orelse @as(c_uint, @intCast(text.len));
         const cursor_byte_clamped: usize = @min(@as(usize, cursor_byte), text.len);
         priv.ax_cached_cursor_offset = @intCast(utf8CpCount(text[0..cursor_byte_clamped]));
 
@@ -3397,7 +3216,7 @@ pub const Surface = extern struct {
     /// handles the common case (stable link set across cursor blinks
     /// and in-place output) and falls through to full rebuild when
     /// links are inserted, deleted, or reordered.
-    fn commitAxLink(
+    pub fn commitLink(
         self: *Self,
         start_cp: c_uint,
         end_cp: c_uint,
@@ -3463,7 +3282,7 @@ pub const Surface = extern struct {
         );
 
         // Note: we intentionally do NOT call
-        // `gtk_accessible_set_accessible_parent` here. `commitAxLink`
+        // `gtk_accessible_set_accessible_parent` here. `commitLink`
         // runs under the renderer mutex inside `axRefreshCache`, and
         // realize → AT-SPI tree-change signal → Orca re-queries us,
         // which would re-enter `axRefreshCache` and deadlock on the
@@ -3503,10 +3322,10 @@ pub const Surface = extern struct {
     }
 
     /// End-of-refresh cleanup for `ax_links_prev`. Disposes every
-    /// entry that `commitAxLink` did not reuse (the tail past
+    /// entry that `commitLink` did not reuse (the tail past
     /// `ax_links_prev_consumed`), then empties the list and resets
     /// the reuse state so the next refresh starts clean. Call this
-    /// after the last `commitAxLink` invocation in a refresh cycle.
+    /// after the last `commitLink` invocation in a refresh cycle.
     fn axFinalizeLinksPrev(self: *Self) void {
         const priv = self.private();
         self.axDisposePrevTail(priv.ax_links_prev_consumed);
@@ -3515,129 +3334,48 @@ pub const Surface = extern struct {
         priv.ax_links_prev_frozen = false;
     }
 
-    /// Scan the freshly-built viewport buffer for configured regex
-    /// links (bare URLs, user-defined patterns) and record them as
-    /// hyperlinks alongside OSC 8 entries.
-    ///
-    /// Blind users can't "hover" to reveal a link, so every
-    /// configured pattern is matched regardless of its `highlight`
-    /// mode — the highlight gate (`hover`, `always_mods`, etc.)
-    /// exists for visual cue purposes on sighted flows, not for
-    /// whether a region is semantically a link.
-    ///
-    /// Dedupes against already-committed OSC 8 ranges: when a
-    /// regex match overlaps an OSC 8 link, the OSC 8 link wins
-    /// (its URI is explicit and authoritative; the regex is a
-    /// guess).
-    ///
-    /// Caller must hold `core_surface.renderer_state.mutex` so
-    /// the `oni.Regex` objects in `core_surface.config.links`
-    /// aren't torn down mid-search.
-    fn axMatchRegexLinks(
+    /// Sink method for `a11y_text.build`: record a non-default style run
+    /// discovered during the viewport walk. Append failure drops the run,
+    /// which degrades to "announced without attributes" rather than
+    /// failing the whole snapshot.
+    pub fn commitStyleRun(
         self: *Self,
-        text: []const u8,
-        core_surface: *CoreSurface,
+        start_cp: c_uint,
+        end_cp: c_uint,
+        style: terminal.Style,
     ) void {
-        if (text.len == 0) return;
-        const links_config = core_surface.config.links;
-        if (links_config.len == 0) return;
-
-        // Snapshot the OSC 8 range set before emitting any regex
-        // hits, so we only check new regex matches against OSC 8
-        // links — not against earlier regex matches from the same
-        // refresh. If two configured regexes both fire on the
-        // same span, both land; Orca's `_adjust_for_links` merely
-        // announces "link" per hit, which is no worse than a
-        // duplicated OSC 8 scenario.
         const priv = self.private();
-        const osc8_end = priv.ax_links.items.len;
+        priv.ax_style_runs.append(std.heap.c_allocator, .{
+            .start_cp = start_cp,
+            .end_cp = end_cp,
+            .style = style,
+        }) catch {};
+    }
 
-        for (links_config) |*link_cfg| {
-            // Incrementally track byte → codepoint position
-            // through `text` so regex offset conversion is O(n)
-            // across all matches for this regex, not O(k·n).
-            // Resets per configured regex (byte_offset rewinds).
-            var scan_byte: usize = 0;
-            var scan_cp: c_uint = 0;
+    /// Sink method for `a11y_text.matchRegexLinks`: how many links have
+    /// been committed so far this refresh. Snapshotted before the regex
+    /// pass so `linkOverlaps` can be scoped to the OSC 8 entries.
+    pub fn committedLinkCount(self: *Self) usize {
+        return self.private().ax_links.items.len;
+    }
 
-            var byte_offset: usize = 0;
-            while (byte_offset < text.len) {
-                var region = link_cfg.regex.search(
-                    text[byte_offset..],
-                    .{},
-                ) catch |err| switch (err) {
-                    error.Mismatch => break,
-                    else => {
-                        log.warn(
-                            "ax regex search failed: {}",
-                            .{err},
-                        );
-                        break;
-                    },
-                };
-                defer region.deinit();
-
-                const rel_start: usize = @intCast(region.starts()[0]);
-                const rel_end: usize = @intCast(region.ends()[0]);
-                const abs_start = byte_offset + rel_start;
-                const abs_end = byte_offset + rel_end;
-
-                // Guard against zero-width matches looping
-                // forever (`a*` etc).
-                byte_offset = if (abs_end > byte_offset)
-                    abs_end
-                else
-                    byte_offset + 1;
-
-                if (abs_end <= abs_start) continue;
-
-                // URL regex shouldn't match newlines, but if a
-                // user-supplied regex crosses one we clip to the
-                // first '\n' so the hyperlink stays on a single
-                // visual row — matches the per-row splitting we
-                // apply to OSC 8 runs during the cell walk.
-                var clipped_end = abs_end;
-                for (text[abs_start..abs_end], 0..) |b, i| {
-                    if (b == '\n') {
-                        clipped_end = abs_start + i;
-                        break;
-                    }
-                }
-                if (clipped_end <= abs_start) continue;
-
-                // Advance the cp cursor to abs_start, recording
-                // cp_start, then to clipped_end for cp_end. Since
-                // regex matches within one config are in byte
-                // order, `scan_byte` is monotonic.
-                while (scan_byte < abs_start) {
-                    scan_cp += 1;
-                    scan_byte += utf8CpLen(text[scan_byte]);
-                }
-                const cp_start = scan_cp;
-                while (scan_byte < clipped_end) {
-                    scan_cp += 1;
-                    scan_byte += utf8CpLen(text[scan_byte]);
-                }
-                const cp_end = scan_cp;
-
-                var overlaps = false;
-                for (priv.ax_links.items[0..osc8_end]) |existing| {
-                    if (cp_start < existing.end_cp and
-                        cp_end > existing.start_cp)
-                    {
-                        overlaps = true;
-                        break;
-                    }
-                }
-                if (overlaps) continue;
-
-                self.commitAxLink(
-                    cp_start,
-                    cp_end,
-                    text[abs_start..clipped_end],
-                );
-            }
+    /// Sink method for `a11y_text.matchRegexLinks`: whether `[start_cp,
+    /// end_cp)` intersects any of the first `limit` committed links.
+    /// `limit` is clamped because a failed commit can leave the list
+    /// shorter than the caller's snapshot.
+    pub fn linkOverlaps(
+        self: *Self,
+        start_cp: c_uint,
+        end_cp: c_uint,
+        limit: usize,
+    ) bool {
+        const priv = self.private();
+        const n = @min(limit, priv.ax_links.items.len);
+        for (priv.ax_links.items[0..n]) |existing| {
+            if (start_cp < existing.end_cp and
+                end_cp > existing.start_cp) return true;
         }
+        return false;
     }
 
     /// Check whether the terminal text or caret has changed since the last
@@ -3654,8 +3392,105 @@ pub const Surface = extern struct {
     /// range and emit a targeted `remove` + `insert` pair. Orca's terminal
     /// script classifies events by the length of `any_data`, so a single-
     /// character insert reads as typing echo rather than command output.
+    /// Cheap per-frame test for "could anything an AT client cares about
+    /// have changed since the last notification?".
+    ///
+    /// Builds only the viewport text — no link lookups, no style runs, no
+    /// hyperlink objects, no regex — into a retained scratch buffer, and
+    /// compares it against the last notified snapshot along with the caret
+    /// and the raw selection bounds. One renderer-mutex acquisition, no
+    /// allocation once the scratch buffer has grown.
+    ///
+    /// Conservative by construction: it may answer `true` on a frame that
+    /// turns out to need no events (the full path re-checks and stays
+    /// silent), but it never answers `false` when something moved. That
+    /// asymmetry is what makes it safe to skip the rebuild entirely.
+    fn axProbeChanged(self: *Self) bool {
+        const priv = self.private();
+        const core_surface = priv.core_surface orelse return false;
+
+        // No snapshot yet means we have never notified; always take the
+        // full path so the first frame establishes one.
+        const old_text: []const u8 = priv.ax_last_snapshot orelse return true;
+
+        const alloc = std.heap.c_allocator;
+        priv.ax_probe_buf.clearRetainingCapacity();
+
+        var null_sink: a11y_text.NullSink = .{};
+        var sel_raw: ?Private.SelRaw = null;
+
+        const result = result: {
+            core_surface.renderer_state.mutex.lockUncancelable(global.io());
+            defer core_surface.renderer_state.mutex.unlock(global.io());
+
+            const screen: *terminal.Screen =
+                core_surface.renderer_state.terminal.screens.active;
+
+            const result = a11y_text.build(
+                alloc,
+                &priv.ax_probe_buf,
+                screen,
+                &null_sink,
+                .{ .track_links = false },
+            ) catch |err| {
+                // Probing failed; fall back to the full path rather than
+                // risk swallowing a change.
+                log.warn("ax probe build failed: {}", .{err});
+                return true;
+            };
+
+            // Raw selection bounds, still under the same lock.
+            if (screen.selection) |sel| sel_raw: {
+                const tl = sel.topLeft(screen);
+                const br = sel.bottomRight(screen);
+                const tl_vp = screen.pages.pointFromPin(.viewport, tl) orelse
+                    break :sel_raw;
+                const br_vp = screen.pages.pointFromPin(.viewport, br) orelse
+                    break :sel_raw;
+                sel_raw = .{
+                    .tl_y = tl_vp.viewport.y,
+                    .tl_x = tl_vp.viewport.x,
+                    .br_y = br_vp.viewport.y,
+                    .br_x = br_vp.viewport.x,
+                };
+            }
+
+            break :result result;
+        };
+
+        // Edge-detect the selection: store this frame's reading regardless
+        // of what we return, so a change is reported exactly once.
+        const prev_sel_raw = priv.ax_last_sel_raw;
+        priv.ax_last_sel_raw = sel_raw;
+        const selection_moved = !std.meta.eql(prev_sel_raw, sel_raw);
+
+        const text = priv.ax_probe_buf.items;
+        if (!std.mem.eql(u8, old_text, text)) return true;
+        if (selection_moved) return true;
+
+        // Text is identical, so the caret's byte offset converts against
+        // the same bytes the cache was built from.
+        const cursor_byte = result.cursor_byte orelse @as(c_uint, @intCast(text.len));
+        const clamped: usize = @min(@as(usize, cursor_byte), text.len);
+        const caret_cp: c_uint = @intCast(utf8CpCount(text[0..clamped]));
+        return caret_cp != priv.ax_last_notified_caret;
+    }
+
     fn axNotifyIfChanged(self: *Self) void {
         const priv = self.private();
+
+        // Gate the whole rebuild behind the cheap probe. On an unchanged
+        // frame this returns without touching the cache, which also means
+        // `ax_cached_text` and `ax_links` stay valid across the frame
+        // boundary instead of being torn down and rebuilt 60 times a
+        // second.
+        if (!self.axProbeChanged()) {
+            // The viewport is byte-identical to what we last notified, so
+            // the cache still describes it: retract this frame's staleness
+            // mark rather than making the next AT read pay for a rebuild.
+            priv.ax_cache_stale = false;
+            return;
+        }
 
         // Drop the existing cache so axRefreshCache rebuilds from the live
         // viewport. The cache is the sole source of truth for AT clients
@@ -3697,6 +3532,14 @@ pub const Surface = extern struct {
         const selection_changed = sel_state.has != priv.ax_last_had_selection or
             sel_state.start != priv.ax_last_selection_start or
             sel_state.end != priv.ax_last_selection_end;
+
+        // First notification against an empty viewport: `text_changed` is
+        // false because both sides are "", but the probe keys off having a
+        // snapshot at all. Record one here or every later frame takes the
+        // full rebuild path.
+        if (priv.ax_last_snapshot == null and !text_changed) {
+            priv.ax_last_snapshot = std.heap.c_allocator.dupeZ(u8, new_text) catch null;
+        }
 
         if (!text_changed and !caret_changed and !selection_changed) return;
 
@@ -3967,32 +3810,12 @@ pub const Surface = extern struct {
         return axEmptyBytes();
     }
 
-    /// Byte length of a UTF-8 codepoint given its leading byte. Malformed
-    /// continuation or overlong starts advance 1 byte so the scan always
-    /// makes forward progress.
-    fn utf8CpLen(b: u8) usize {
-        if (b < 0x80) return 1;
-        if (b < 0xC0) return 1;
-        if (b < 0xE0) return 2;
-        if (b < 0xF0) return 3;
-        return 4;
-    }
-
-    /// Count UTF-8 codepoints in `s`.
-    fn utf8CpCount(s: []const u8) usize {
-        var i: usize = 0;
-        var n: usize = 0;
-        while (i < s.len) : (n += 1) i += utf8CpLen(s[i]);
-        return n;
-    }
-
-    /// Byte offset of the `cp_idx`-th codepoint in `s`. Clamps at `s.len`.
-    fn utf8CpToByte(s: []const u8, cp_idx: usize) usize {
-        var i: usize = 0;
-        var c: usize = 0;
-        while (i < s.len and c < cp_idx) : (c += 1) i += utf8CpLen(s[i]);
-        return i;
-    }
+    // UTF-8 codepoint offset helpers. Every offset we hand to AT-SPI is
+    // in codepoints, never bytes; these live in `a11y_text` so the walk
+    // and the benchmark share one implementation.
+    const utf8CpLen = a11y_text.utf8CpLen;
+    const utf8CpCount = a11y_text.utf8CpCount;
+    const utf8CpToByte = a11y_text.utf8CpToByte;
 
     fn axGetContentsAt(
         self_opaque: *gtk.AccessibleText,
@@ -5609,7 +5432,17 @@ pub const Surface = extern struct {
         // text actually changed since the last notification. We only emit the
         // AT-SPI change events when something actually changed, so we don't
         // interrupt Orca (or any other AT client) mid-read on every GL frame.
-        if (priv.ax_active) self.axNotifyIfChanged();
+        //
+        // Gated on focus as well as `ax_active`. GTK gives us no signal for
+        // "the last AT client went away", so `ax_active` latches on at the
+        // first query and never clears — without the focus check we would
+        // keep probing every frame forever, including long after Orca has
+        // exited. Change *events* are only meaningful for the surface the
+        // user is on; on-demand reads (flat review, caret queries) go
+        // through the GtkAccessibleText vfuncs and keep working on any
+        // surface, focused or not.
+        priv.ax_cache_stale = true;
+        if (priv.ax_active and priv.focused) self.axNotifyIfChanged();
 
         return 1;
     }
