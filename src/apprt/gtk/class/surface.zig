@@ -2851,28 +2851,6 @@ pub const Surface = extern struct {
     //---------------------------------------------------------------
     // GtkAccessibleText interface implementation
 
-    /// Extension of zig-gobject 0.3.0's `gtk.AccessibleTextInterface`
-    /// that exposes the GTK 4.22 trailing slots (`set_caret_position` and
-    /// `set_selection`). Our pinned bindings stop at `f_get_offset`
-    /// (GTK 4.16), but at runtime `G_DEFINE_INTERFACE` allocates the
-    /// vtable at GTK's own `sizeof(GtkAccessibleTextInterface)` — so on
-    /// a GTK 4.22+ runtime the trailing slots exist in memory and can be
-    /// written via a wider view. Same runtime-resolution philosophy as
-    /// `a11y_hypertext.zig` (CLAUDE.md gotcha #9): assign only when the
-    /// runtime version supports it, and degrade gracefully otherwise.
-    const AccessibleTextInterfaceExt = extern struct {
-        base: gtk.AccessibleTextInterface,
-        f_set_caret_position: ?*const fn (
-            *gtk.AccessibleText,
-            c_uint,
-        ) callconv(.c) c_int,
-        f_set_selection: ?*const fn (
-            *gtk.AccessibleText,
-            usize,
-            *gtk.AccessibleTextRange,
-        ) callconv(.c) c_int,
-    };
-
     fn accessibleTextIfaceInit(iface: *gtk.AccessibleTextInterface) callconv(.c) void {
         iface.f_get_contents = &axGetContents;
         iface.f_get_contents_at = &axGetContentsAt;
@@ -2883,13 +2861,16 @@ pub const Surface = extern struct {
         iface.f_get_extents = &axGetExtents;
         iface.f_get_offset = &axGetOffset;
 
-        // GTK 4.22+ trailing slots. Guarded on the runtime version —
-        // on older GTK the slots aren't part of the allocated vtable
-        // and writing to them would scribble past it.
+        // GTK 4.22+ trailing slots. Still guarded on the *runtime* version:
+        // our bindings declare these fields, but `G_DEFINE_INTERFACE`
+        // allocates the vtable at the running GTK's own
+        // `sizeof(GtkAccessibleTextInterface)`. On a pre-4.22 runtime the
+        // slots are not part of that allocation and writing them would
+        // scribble past it. GTK installs defaults that return FALSE, so
+        // leaving them alone degrades gracefully.
         if (gtk_version.runtimeAtLeast(4, 22, 0)) {
-            const ext_iface: *AccessibleTextInterfaceExt = @ptrCast(iface);
-            ext_iface.f_set_caret_position = &axSetCaretPosition;
-            ext_iface.f_set_selection = &axSetSelection;
+            iface.f_set_caret_position = &axSetCaretPosition;
+            iface.f_set_selection = &axSetSelection;
         }
     }
 
