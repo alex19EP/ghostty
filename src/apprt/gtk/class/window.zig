@@ -1698,6 +1698,25 @@ pub const Window = extern struct {
         // If the tab was previously marked as needing attention
         // (e.g. due to a bell character), we now unmark that
         page.setNeedsAttention(@intFromBool(false));
+
+        // Move keyboard focus to the newly selected tab's active surface.
+        // Without this, focus stays on whatever triggered the switch (tab
+        // bar via Ctrl+Tab / Ctrl+Page_Up / Ctrl+Page_Down, or the tab
+        // overview), so key input doesn't reach the terminal and the
+        // accessible-focused object stays in the switcher — breaking Orca
+        // flat review on the active surface.
+        if (gobject.ext.cast(Tab, child)) |tab| {
+            if (tab.getActiveSurface()) |surface| surface.grabFocus();
+        }
+
+        // Announce the selected tab to screen readers. Switching tabs
+        // moves focus from one terminal surface to another — same role,
+        // so Orca treats the focus-changed event as a no-op and stays
+        // silent. Push the new tab's title as an explicit announcement
+        // so the user knows where they landed.
+        if (priv.tab_view.getNPages() > 1) {
+            self.as(gtk.Accessible).announce(page.getTitle(), .medium);
+        }
     }
 
     fn tabViewPageAttached(
