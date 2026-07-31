@@ -123,6 +123,141 @@ pub fn scrollK(old_text: []const u8, new_text: []const u8) usize {
     return 0;
 }
 
+/// How many terminal columns each codepoint of a snapshot occupies.
+///
+/// The snapshot holds one codepoint per *character*, but a terminal row is
+/// a grid of *cells*, and the two do not correspond: a double-width
+/// character (CJK, an emoji in emoji presentation) is one codepoint across
+/// two columns, while the combining marks of a grapheme cluster are
+/// codepoints across no columns of their own. Equating codepoint index
+/// with column — which every function here used to do — puts a caret, a
+/// click, or a highlight one column left per wide character preceding it
+/// on the row.
+///
+/// Nothing in the text records that, so `a11y_text.build` records it here
+/// as it walks the cells. The widths therefore come from the same cell
+/// data the renderer draws from, rather than from a width table this
+/// module would have to keep in sync with the terminal's own idea of how
+/// wide a character rendered — which depends on the configured
+/// grapheme-width method and cannot be re-derived from the text alone.
+pub const CellWidths = struct {
+    /// Columns occupied by the i-th codepoint of the snapshot. Indices
+    /// past the end read as 1, so a short or absent slice degrades to one
+    /// column per codepoint instead of going out of bounds.
+    per_cp: []const u8 = &.{},
+
+    /// Widths for a snapshot whose cell data we don't have. Exact for
+    /// all-single-width text and off by a column per wide character
+    /// otherwise, so pass it only where an approximate answer beats no
+    /// answer at all.
+    pub const uniform: CellWidths = .{};
+
+    pub fn at(self: CellWidths, cp_idx: usize) u32 {
+        if (cp_idx >= self.per_cp.len) return 1;
+        return self.per_cp[cp_idx];
+    }
+};
+
+/// Where a row begins, in both units we need to walk it: bytes to index
+/// `text`, codepoints to index `CellWidths`.
+const RowStart = struct {
+    byte: usize,
+    cp: usize,
+};
+
+/// Locate the start of `row`, or null when the snapshot has fewer rows.
+fn rowStart(text: []const u8, row: u32) ?RowStart {
+    if (row == 0) return .{ .byte = 0, .cp = 0 };
+
+    var byte: usize = 0;
+    var cp: usize = 0;
+    var seen: u32 = 0;
+    while (byte < text.len) {
+        const is_newline = text[byte] == '\n';
+        byte += utf8CpLen(text[byte]);
+        cp += 1;
+        if (!is_newline) continue;
+        seen += 1;
+        if (seen == row) return .{ .byte = byte, .cp = cp };
+    }
+    return null;
+}
+
+/// Start of the last row in the snapshot. A snapshot ending in '\n' has an
+/// empty last row, and this returns its (past-the-end) start.
+fn lastRowStart(text: []const u8) RowStart {
+    var out: RowStart = .{ .byte = 0, .cp = 0 };
+    var byte: usize = 0;
+    var cp: usize = 0;
+    while (byte < text.len) {
+        const is_newline = text[byte] == '\n';
+        byte += utf8CpLen(text[byte]);
+        cp += 1;
+        if (is_newline) out = .{ .byte = byte, .cp = cp };
+    }
+    return out;
+}
+
+/// Codepoint index of the character occupying column `col` of the row
+/// starting at `start`.
+///
+/// A column past the row's last cell resolves to one past its last
+/// codepoint — where a caret at end of line belongs.
+fn cpAtColumn(
+    text: []const u8,
+    widths: CellWidths,
+    start: RowStart,
+    col: u32,
+) usize {
+    var byte = start.byte;
+    var cp = start.cp;
+    var column: u32 = 0;
+    while (byte < text.len and text[byte] != '\n') {
+        const w = widths.at(cp);
+        // Zero-width codepoints (the combining marks of a grapheme
+        // cluster) live in the cell their base character opened, so a
+        // column resolves to that base and never to one of them.
+        if (w > 0 and col < column + w) return cp;
+        column += w;
+        byte += utf8CpLen(text[byte]);
+        cp += 1;
+    }
+    return cp;
+}
+
+/// Column at which codepoint `cp_idx` sits, counted from the start of its
+/// own row. `cp_idx` must be at or after `start`.
+///
+/// A zero-width codepoint reports the column of the cell it shares rather
+/// than the next one along, so it stays the inverse of `cpAtColumn`: that
+/// resolves a column to the base character, and this resolves the base's
+/// marks back to the same column. Running off the end of the row instead
+/// reports the row's full width, which is where a caret at end of line
+/// belongs.
+fn columnOfCp(
+    text: []const u8,
+    widths: CellWidths,
+    start: RowStart,
+    cp_idx: usize,
+) u32 {
+    var byte = start.byte;
+    var cp = start.cp;
+    var column: u32 = 0;
+    // Column at which the cell currently being filled began.
+    var cell_start: u32 = 0;
+    while (byte < text.len and text[byte] != '\n' and cp < cp_idx) {
+        const w = widths.at(cp);
+        if (w > 0) cell_start = column;
+        column += w;
+        byte += utf8CpLen(text[byte]);
+        cp += 1;
+    }
+
+    const in_row = byte < text.len and text[byte] != '\n';
+    if (in_row and widths.at(cp_idx) == 0) return cell_start;
+    return column;
+}
+
 /// Map (row, col) in the snapshot to a codepoint offset. Returns null
 /// when `row` is past the last row in `text`.
 ///
@@ -130,73 +265,51 @@ pub fn scrollK(old_text: []const u8, new_text: []const u8) usize {
 /// difference is deliberate: a selection anchored to a row that scrolled
 /// out of the viewport has no offset and must be dropped, whereas a
 /// pointer event below the last row should still resolve to something.
-pub fn rowColToCp(text: []const u8, row: u32, col: u32) ?usize {
-    var seen_nl: u32 = 0;
-    var row_start: usize = 0;
-    if (row > 0) {
-        var i: usize = 0;
-        while (i < text.len) : (i += 1) {
-            if (text[i] == '\n') {
-                seen_nl += 1;
-                if (seen_nl == row) {
-                    row_start = i + 1;
-                    break;
-                }
-            }
-        }
-        if (seen_nl < row) return null;
-    }
-    var row_end: usize = row_start;
-    var row_cp: u32 = 0;
-    while (row_end < text.len and text[row_end] != '\n') {
-        row_end += utf8CpLen(text[row_end]);
-        row_cp += 1;
-    }
-    const clamped_col: u32 = @min(col, row_cp);
-    const row_prefix_cp = utf8CpCount(text[0..row_start]);
-    return row_prefix_cp + clamped_col;
+///
+/// Either cell of a double-width character resolves to that character.
+pub fn rowColToCp(
+    text: []const u8,
+    widths: CellWidths,
+    row: u32,
+    col: u32,
+) ?usize {
+    const start = rowStart(text, row) orelse return null;
+    return cpAtColumn(text, widths, start, col);
 }
 
 /// Map (row, col) to a codepoint offset, clamping a row past the end of
 /// the snapshot to the last row and a column past end-of-row to the row
 /// length. Always resolves; see `rowColToCp` for the variant that fails.
-pub fn offsetAtGrid(text: []const u8, want_row: u32, col_in: u32) c_uint {
-    var col = col_in;
+pub fn offsetAtGrid(
+    text: []const u8,
+    widths: CellWidths,
+    want_row: u32,
+    col: u32,
+) c_uint {
+    const start = rowStart(text, want_row) orelse lastRowStart(text);
+    return @intCast(cpAtColumn(text, widths, start, col));
+}
 
-    // Single-pass scan: find the byte offset where row `want_row` begins.
-    // If the point is past the last row, fall back to the start of
-    // whatever the last row in the buffer is.
-    var row_start: usize = 0;
-    var last_row_start: usize = 0;
-    var seen_newlines: u32 = 0;
-    var i: usize = 0;
-    while (i < text.len) : (i += 1) {
-        if (text[i] == '\n') {
-            seen_newlines += 1;
-            last_row_start = i + 1;
-            if (seen_newlines == want_row) {
-                row_start = i + 1;
-                break;
-            }
-        }
+/// Map a codepoint offset back to the grid position it occupies — the
+/// inverse of `rowColToCp`, and the one conversion both the caret click
+/// and `extentsCells` are built on.
+pub fn cpToGrid(text: []const u8, widths: CellWidths, cp_idx: usize) GridPos {
+    const cp = @min(cp_idx, utf8CpCount(text));
+    const byte = utf8CpToByte(text, cp);
+
+    var row: u32 = 0;
+    for (text[0..byte]) |ch| {
+        if (ch == '\n') row += 1;
     }
-    if (seen_newlines < want_row) row_start = last_row_start;
 
-    // Measure the codepoint length of the row and clamp the requested
-    // column to it.
-    var row_end: usize = row_start;
-    var row_cp_count: u32 = 0;
-    while (row_end < text.len and text[row_end] != '\n') {
-        row_end += utf8CpLen(text[row_end]);
-        row_cp_count += 1;
-    }
-    if (col > row_cp_count) col = row_cp_count;
+    var row_start_byte: usize = byte;
+    while (row_start_byte > 0 and text[row_start_byte - 1] != '\n') : (row_start_byte -= 1) {}
+    const start: RowStart = .{
+        .byte = row_start_byte,
+        .cp = cp - utf8CpCount(text[row_start_byte..byte]),
+    };
 
-    // Advance `col` codepoints into the row. `row_start` and `row_end`
-    // are codepoint-aligned by construction, so the slice is safe to
-    // walk.
-    const byte_offset = row_start + utf8CpToByte(text[row_start..row_end], col);
-    return @intCast(utf8CpCount(text[0..byte_offset]));
+    return .{ .row = row, .col = columnOfCp(text, widths, start, cp) };
 }
 
 /// A position on the terminal grid, in cells.
@@ -241,37 +354,33 @@ pub const GridRect = struct {
 ///
 /// Rows must come out distinct per line — a screen reader's flat review
 /// collapses to a single line if every row reports the same Y.
-pub fn extentsCells(text: []const u8, start: c_uint, end: c_uint) GridRect {
+pub fn extentsCells(
+    text: []const u8,
+    widths: CellWidths,
+    start: c_uint,
+    end: c_uint,
+) GridRect {
     const text_cp_count: c_uint = @intCast(utf8CpCount(text));
     const s_cp = @min(start, text_cp_count);
     const e_cp = @min(end, text_cp_count);
-    const s_byte = utf8CpToByte(text, s_cp);
-    const e_byte = utf8CpToByte(text, e_cp);
 
-    // Row index of `s_byte` within the viewport: count newlines before it.
-    var row: u32 = 0;
-    for (text[0..s_byte]) |ch| {
-        if (ch == '\n') row += 1;
-    }
+    const pos = cpToGrid(text, widths, s_cp);
 
-    // Column index of `s_byte`: scan back to the last newline (or start)
-    // and count codepoints in that prefix — one codepoint per terminal
-    // cell in our dump.
-    var col_start: usize = s_byte;
-    while (col_start > 0 and text[col_start - 1] != '\n') : (col_start -= 1) {}
-    const col: u32 = @intCast(utf8CpCount(text[col_start..s_byte]));
-
-    // Width in cells: codepoints from `s_byte` to the first newline (or
-    // `e_byte`), whichever comes first.
+    // Width in cells: the columns taken by the codepoints from `s_cp` up
+    // to `e_cp`, stopping at the row end. A zero here means the range
+    // covered nothing that occupies a cell (an empty range, or combining
+    // marks alone), and AT clients need a rect they can point at.
     var width_cols: u32 = 0;
-    var i_byte: usize = s_byte;
-    while (i_byte < e_byte and text[i_byte] != '\n') {
-        i_byte += utf8CpLen(text[i_byte]);
-        width_cols += 1;
+    var byte = utf8CpToByte(text, s_cp);
+    var cp: usize = s_cp;
+    while (cp < e_cp and byte < text.len and text[byte] != '\n') {
+        width_cols += widths.at(cp);
+        byte += utf8CpLen(text[byte]);
+        cp += 1;
     }
     if (width_cols == 0) width_cols = 1;
 
-    return .{ .row = row, .col = col, .width_cols = width_cols };
+    return .{ .row = pos.row, .col = pos.col, .width_cols = width_cols };
 }
 
 /// Text granularities we resolve. GTK's enum also carries `sentence` and
@@ -493,25 +602,92 @@ test "grid: rowColToCp counts codepoints, not bytes" {
     // Row 1 begins 7 bytes in but only 3 codepoints in (two box drawing
     // characters plus the newline, which is itself a codepoint). Counting
     // bytes here would report 7 and push every offset off the end.
-    try testing.expectEqual(@as(?usize, 3), rowColToCp(text, 1, 0));
-    try testing.expectEqual(@as(?usize, 5), rowColToCp(text, 1, 2));
-    try testing.expectEqual(@as(?usize, 1), rowColToCp(text, 0, 1));
+    try testing.expectEqual(@as(?usize, 3), rowColToCp(text, .uniform, 1, 0));
+    try testing.expectEqual(@as(?usize, 5), rowColToCp(text, .uniform, 1, 2));
+    try testing.expectEqual(@as(?usize, 1), rowColToCp(text, .uniform, 0, 1));
 }
 
 test "grid: rowColToCp clamps column, fails past the last row" {
     const text = "ab\ncd";
-    try testing.expectEqual(@as(?usize, 5), rowColToCp(text, 1, 99));
-    try testing.expectEqual(@as(?usize, null), rowColToCp(text, 7, 0));
+    try testing.expectEqual(@as(?usize, 5), rowColToCp(text, .uniform, 1, 99));
+    try testing.expectEqual(@as(?usize, null), rowColToCp(text, .uniform, 7, 0));
 }
 
 test "grid: offsetAtGrid clamps instead of failing" {
     const text = "ab\ncd";
     // Same in-range answers as rowColToCp...
-    try testing.expectEqual(@as(c_uint, 3), offsetAtGrid(text, 1, 0));
+    try testing.expectEqual(@as(c_uint, 3), offsetAtGrid(text, .uniform, 1, 0));
     // ...but a row past the end resolves into the last row rather than
     // returning nothing.
-    try testing.expectEqual(@as(c_uint, 3), offsetAtGrid(text, 7, 0));
-    try testing.expectEqual(@as(c_uint, 5), offsetAtGrid(text, 7, 99));
+    try testing.expectEqual(@as(c_uint, 3), offsetAtGrid(text, .uniform, 7, 0));
+    try testing.expectEqual(@as(c_uint, 5), offsetAtGrid(text, .uniform, 7, 99));
+}
+
+// Three double-width characters followed by ASCII: one codepoint each,
+// two columns each, so codepoint index and column part ways at the very
+// first character.
+const wide_row = "日本語ab";
+const wide_widths: CellWidths = .{ .per_cp = &.{ 2, 2, 2, 1, 1 } };
+
+test "grid: a wide character spans two columns" {
+    // 'a' is codepoint 3 but column 6. Reading the codepoint index as a
+    // column is the bug this exists to prevent: it lands three columns
+    // to the left, on 語.
+    try testing.expectEqual(@as(?usize, 3), rowColToCp(wide_row, wide_widths, 0, 6));
+    try testing.expectEqual(@as(u32, 6), cpToGrid(wide_row, wide_widths, 3).col);
+
+    // Both cells of a wide character resolve to that character, so a
+    // click on either half routes to the same place.
+    try testing.expectEqual(@as(?usize, 1), rowColToCp(wide_row, wide_widths, 0, 2));
+    try testing.expectEqual(@as(?usize, 1), rowColToCp(wide_row, wide_widths, 0, 3));
+
+    // Round trip: every codepoint's column maps back to itself.
+    for (0..5) |cp| {
+        const col = cpToGrid(wide_row, wide_widths, cp).col;
+        try testing.expectEqual(@as(?usize, cp), rowColToCp(wide_row, wide_widths, 0, col));
+    }
+}
+
+test "grid: widths are per row, and rows keep their own columns" {
+    const text = "日本\nab";
+    const widths: CellWidths = .{ .per_cp = &.{ 2, 2, 0, 1, 1 } };
+
+    // Row 0: column 2 is the second wide character.
+    try testing.expectEqual(@as(?usize, 1), rowColToCp(text, widths, 0, 2));
+    // Row 1 starts its column count over, and its offsets are unaffected
+    // by the wide characters above it.
+    try testing.expectEqual(@as(?usize, 3), rowColToCp(text, widths, 1, 0));
+    try testing.expectEqual(@as(?usize, 4), rowColToCp(text, widths, 1, 1));
+    try testing.expectEqual(GridPos{ .row = 1, .col = 1 }, cpToGrid(text, widths, 4));
+}
+
+test "grid: zero-width codepoints share their base character's cell" {
+    // "e" + a combining acute: two codepoints, one column.
+    const text = "e\u{0301}x";
+    const widths: CellWidths = .{ .per_cp = &.{ 1, 0, 1 } };
+
+    // Column 0 resolves to the base character, never to the mark.
+    try testing.expectEqual(@as(?usize, 0), rowColToCp(text, widths, 0, 0));
+    // 'x' follows in the next column even though it is codepoint 2.
+    try testing.expectEqual(@as(?usize, 2), rowColToCp(text, widths, 0, 1));
+    try testing.expectEqual(@as(u32, 1), cpToGrid(text, widths, 2).col);
+    // The mark itself reports its base character's column.
+    try testing.expectEqual(@as(u32, 0), cpToGrid(text, widths, 1).col);
+}
+
+test "grid: missing widths degrade to one column per codepoint" {
+    // Short slices and empty ones read as width 1 past their end, which
+    // is the pre-widths behaviour rather than an out-of-bounds read.
+    const short: CellWidths = .{ .per_cp = &.{2} };
+    try testing.expectEqual(@as(?usize, 1), rowColToCp(wide_row, short, 0, 2));
+    try testing.expectEqual(@as(?usize, 2), rowColToCp(wide_row, short, 0, 3));
+    try testing.expectEqual(@as(?usize, 3), rowColToCp(wide_row, .uniform, 0, 3));
+}
+
+test "grid: cpToGrid clamps an offset past the end" {
+    const text = "ab\ncd";
+    // Past-the-end lands at the end of the last row, not out of bounds.
+    try testing.expectEqual(GridPos{ .row = 1, .col = 2 }, cpToGrid(text, .uniform, 99));
 }
 
 test "grid: pointToGrid survives negative and non-finite input" {
@@ -542,29 +718,50 @@ test "grid: pointToGrid survives negative and non-finite input" {
 test "extents: each row reports a distinct row index" {
     const text = "row0\nrow1\nrow2";
     // Flat review collapses to one line if these ever coincide.
-    try testing.expectEqual(@as(u32, 0), extentsCells(text, 0, 1).row);
-    try testing.expectEqual(@as(u32, 1), extentsCells(text, 5, 6).row);
-    try testing.expectEqual(@as(u32, 2), extentsCells(text, 10, 11).row);
+    try testing.expectEqual(@as(u32, 0), extentsCells(text, .uniform, 0, 1).row);
+    try testing.expectEqual(@as(u32, 1), extentsCells(text, .uniform, 5, 6).row);
+    try testing.expectEqual(@as(u32, 2), extentsCells(text, .uniform, 10, 11).row);
 }
 
 test "extents: column and width are in cells, not bytes" {
     const text = box_v ++ box_v ++ "abc";
     // Third codepoint sits at column 2 even though it is byte 6.
-    const r = extentsCells(text, 2, 5);
+    const r = extentsCells(text, .uniform, 2, 5);
     try testing.expectEqual(@as(u32, 0), r.row);
     try testing.expectEqual(@as(u32, 2), r.col);
     try testing.expectEqual(@as(u32, 3), r.width_cols);
 }
 
+test "extents: a wide character is two cells wide and shifts what follows" {
+    // Highlighting 語 must cover both its columns, and 'a' after it must
+    // start at column 6 — otherwise a screen reader's highlight sits a
+    // character behind the text it is reading.
+    const wide = extentsCells(wide_row, wide_widths, 2, 3);
+    try testing.expectEqual(@as(u32, 4), wide.col);
+    try testing.expectEqual(@as(u32, 2), wide.width_cols);
+
+    const after = extentsCells(wide_row, wide_widths, 3, 5);
+    try testing.expectEqual(@as(u32, 6), after.col);
+    try testing.expectEqual(@as(u32, 2), after.width_cols);
+
+    // The whole row: three wide characters plus two narrow ones.
+    try testing.expectEqual(@as(u32, 8), extentsCells(wide_row, wide_widths, 0, 5).width_cols);
+}
+
 test "extents: width stops at the row end and never reports zero" {
     const text = "ab\ncdef";
     // Range spans the newline; width covers only the first row.
-    const spanning = extentsCells(text, 0, 6);
+    const spanning = extentsCells(text, .uniform, 0, 6);
     try testing.expectEqual(@as(u32, 2), spanning.width_cols);
 
     // An empty range still reports one cell so the rect is visible.
-    const empty = extentsCells(text, 1, 1);
+    const empty = extentsCells(text, .uniform, 1, 1);
     try testing.expectEqual(@as(u32, 1), empty.width_cols);
+
+    // So does a range covering only zero-width codepoints: a combining
+    // mark alone sums to no columns, but an AT client still needs a rect.
+    const marks: CellWidths = .{ .per_cp = &.{ 1, 0, 1 } };
+    try testing.expectEqual(@as(u32, 1), extentsCells("e\u{0301}x", marks, 1, 2).width_cols);
 }
 
 test "contents: character granularity returns one whole codepoint" {
