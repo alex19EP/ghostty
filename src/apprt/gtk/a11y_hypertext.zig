@@ -1,16 +1,28 @@
-//! Hand-declared bindings for GTK 4.22's `GtkAccessibleHypertext` /
-//! `GtkAccessibleHyperlink`. zig-gobject 0.3.0 (our current dep) does not
-//! expose these yet, and Ghostty does not hard-require GTK 4.22, so we
-//! resolve the symbols at runtime via `dlsym` on the already-loaded
-//! libgtk. On older GTK, `available` stays false and all Hypertext
+//! Runtime symbol resolution for GTK 4.22's `GtkAccessibleHypertext` /
+//! `GtkAccessibleHyperlink`.
+//!
+//! The *types* come from our gobject bindings, which declare both. Only the
+//! three *symbols* are resolved at runtime, via `dlsym` on the already-loaded
+//! libgtk. That is deliberate: Ghostty runs against GTK as old as 4.14 (see
+//! the `runtimeAtLeast` gates throughout `apprt/gtk`), and linking
+//! `gtk_accessible_hypertext_get_type` directly would make the binary fail to
+//! load at all on anything older, rather than merely doing without link
+//! announcement. On older GTK, `available` stays false and all Hypertext
 //! machinery in `surface.zig` becomes a no-op.
+//!
+//! Nothing here re-declares a GTK struct. An `extern struct` written by hand
+//! to match a GTK vtable fails silently once GTK or the bindings move: it
+//! compiles, every test passes, and the vfuncs simply never fire.
+//!
+//! If Ghostty ever hard-requires GTK >= 4.22, this file collapses to nothing:
+//! list `gtk.AccessibleHypertext` directly in `Surface.Implements`, call
+//! `gtk.AccessibleHyperlink.new` directly, and delete it.
 //!
 //! Call `init()` once during `Application.startup`, before any surface
 //! instances exist (interface registration in `Class.init` reads
 //! `available`).
 
 const std = @import("std");
-const glib = @import("glib");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
 
@@ -18,62 +30,41 @@ const gtk_version = @import("gtk_version.zig");
 
 const log = std.log.scoped(.gtk_a11y_hypertext);
 
-/// Opaque stand-in for `GtkAccessibleHypertext`. Only used as a typed
-/// pointer through the interface vtable; we never instantiate one.
-pub const AccessibleHypertext = opaque {
-    /// Alias so this type slots into `gobject.ext.implement`, which
-    /// expects interfaces to expose their vtable type as `Iface`.
+/// Re-exported from the bindings so `surface.zig` has a single import for
+/// the whole hypertext story.
+pub const AccessibleHypertext = gtk.AccessibleHypertext;
+pub const AccessibleHyperlink = gtk.AccessibleHyperlink;
+pub const AccessibleHypertextInterface = gtk.AccessibleHypertextInterface;
+
+/// Type tag for `Surface.Implements` and `gobject.ext.implement`.
+///
+/// Stands in for `AccessibleHypertext` in the registration machinery only,
+/// because that is the one place that needs the GType — and asking the
+/// bindings for it (`gtk.AccessibleHypertext.getGObjectType`) would link the
+/// 4.22-only symbol. Everything else, vfunc signatures included, uses
+/// `AccessibleHypertext`.
+pub const AccessibleHypertextImpl = opaque {
+    /// `gobject.ext.implement` expects interfaces to expose their vtable
+    /// type as `Iface`.
     pub const Iface = AccessibleHypertextInterface;
 
     pub fn getGObjectType() gobject.Type {
-        // `defineClass`'s implements loop calls this *before* any
-        // instance exists — so `Class.init` hasn't run yet and init()
-        // hasn't been called from there. Auto-init on first query so
-        // the GType is resolvable immediately.
+        // `defineClass`'s implements loop calls this *before* any instance
+        // exists — so `Class.init` hasn't run yet and `init()` hasn't been
+        // called from there. Auto-init on first query so the GType is
+        // resolvable immediately. Returns 0 on older GTK, and GObject then
+        // declines to add the interface.
         init();
         const f = syms.hypertext_get_type orelse return 0;
         return f();
     }
 };
 
-/// Opaque stand-in for `GtkAccessibleHyperlink`. Instances are
-/// constructed via `hyperlinkNew` and released with `unref`.
-pub const AccessibleHyperlink = opaque {
-    pub fn getGObjectType() gobject.Type {
-        init();
-        const f = syms.hyperlink_get_type orelse return 0;
-        return f();
-    }
-
-    pub fn unref(self: *AccessibleHyperlink) void {
-        const obj: *gobject.Object = @ptrCast(@alignCast(self));
-        obj.unref();
-    }
-};
-
-/// Vtable layout from `/usr/include/gtk-4.0/gtk/gtkaccessiblehypertext.h`:
-///
-///   struct _GtkAccessibleHypertextInterface {
-///     GTypeInterface g_iface;
-///     unsigned int (*get_n_links)(GtkAccessibleHypertext *);
-///     GtkAccessibleHyperlink *(*get_link)(GtkAccessibleHypertext *,
-///                                         unsigned int);
-///     unsigned int (*get_link_at)(GtkAccessibleHypertext *,
-///                                 unsigned int);
-///   };
-pub const AccessibleHypertextInterface = extern struct {
-    g_iface: gobject.TypeInterface,
-    get_n_links: ?*const fn (*AccessibleHypertext) callconv(.c) c_uint,
-    get_link: ?*const fn (*AccessibleHypertext, c_uint) callconv(.c) *AccessibleHyperlink,
-    get_link_at: ?*const fn (*AccessibleHypertext, c_uint) callconv(.c) c_uint,
-};
-
-const HyperlinkNewFn = *const fn (
-    *AccessibleHypertext,
-    c_uint,
-    [*:0]const u8,
-    *gtk.AccessibleTextRange,
-) callconv(.c) *AccessibleHyperlink;
+/// Signature borrowed from the bindings' own declaration, so a GTK signature
+/// change becomes a compile error here instead of a silent ABI mismatch at
+/// the `dlsym` boundary. `@TypeOf` does not evaluate its operand, so this
+/// does not emit a link-time reference to the symbol.
+const HyperlinkNewFn = *const @TypeOf(gtk.AccessibleHyperlink.new);
 
 const GetTypeFn = *const fn () callconv(.c) gobject.Type;
 
