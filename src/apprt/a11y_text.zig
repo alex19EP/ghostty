@@ -31,6 +31,21 @@ pub const Options = struct {
     /// than 4.22, where the Hypertext interface isn't registered), so we
     /// don't pay for hyperlink lookups nothing will read.
     track_links: bool = true,
+
+    /// Where to record how many columns each emitted codepoint occupies
+    /// (`a11y_offsets.CellWidths`). One entry is appended per codepoint
+    /// appended to `buffer`, so the two stay index-aligned: 2 for a
+    /// double-width cell, 0 for a combining mark that shares its base
+    /// character's cell, 1 otherwise.
+    ///
+    /// This is the only place the mapping is knowable — the cell walk is
+    /// what sees `cell.wide`, and the text alone cannot be re-measured
+    /// afterwards without guessing at the terminal's grapheme-width
+    /// method. Callers that only need the text (the per-frame change
+    /// probe, the benchmark) leave it null and pay nothing.
+    ///
+    /// Must be empty when `build` is called; `build` only appends.
+    widths: ?*std.ArrayList(u8) = null,
 };
 
 pub const Result = struct {
@@ -104,6 +119,22 @@ pub fn build(
 
     const track_links = opts.track_links;
 
+    // Cell widths, appended in lockstep with the codepoints below so the
+    // two stay index-aligned. Null when the caller only wants text.
+    const widths = opts.widths;
+    if (widths) |w| std.debug.assert(w.items.len == 0);
+    const pushWidth = struct {
+        fn f(
+            a: Allocator,
+            out: ?*std.ArrayList(u8),
+            columns: u8,
+            n: usize,
+        ) Allocator.Error!void {
+            const list = out orelse return;
+            try list.appendNTimes(a, columns, n);
+        }
+    }.f;
+
     // Currently-open run inside a single row. Closed and committed at the
     // end of the row, on link-id transition, or on an interrupting blank
     // cell. `uri` is a slice borrowed from `page.memory`.
@@ -148,6 +179,9 @@ pub fn build(
             // advancing `cp_count` past it.
             closeStyle(sink, &cur_style, cp_count);
             try buffer.append(alloc, '\n');
+            // A row separator, not a cell: it occupies no column, and
+            // column math never crosses it.
+            try pushWidth(alloc, widths, 0, 1);
             cp_count += 1;
         }
 
@@ -217,6 +251,8 @@ pub fn build(
                     cursor_blank_idx = null;
                 }
                 try buffer.appendNTimes(alloc, ' ', blank_cells);
+                // One blank cell, one space, one column.
+                try pushWidth(alloc, widths, 1, blank_cells);
                 cp_count += @intCast(blank_cells);
                 blank_cells = 0;
             }
@@ -286,13 +322,22 @@ pub fn build(
                 };
             }
 
+            // Columns this cell covers on screen. `.wide` cells are
+            // followed by a `.spacer_tail` that the switch above skipped,
+            // so the character is one codepoint standing in for two
+            // columns — the whole reason widths cannot be recovered from
+            // the text later.
+            const cell_columns: u8 = if (cell.wide == .wide) 2 else 1;
+
             var ubuf: [4]u8 = undefined;
             const n = std.unicode.utf8Encode(cell.codepoint(), &ubuf) catch {
                 try buffer.append(alloc, '?');
+                try pushWidth(alloc, widths, cell_columns, 1);
                 cp_count += 1;
                 continue;
             };
             try buffer.appendSlice(alloc, ubuf[0..n]);
+            try pushWidth(alloc, widths, cell_columns, 1);
             cp_count += 1;
 
             if (cell.hasGrapheme()) {
@@ -300,6 +345,9 @@ pub fn build(
                     for (graphemes) |cp| {
                         const gn = std.unicode.utf8Encode(cp, &ubuf) catch continue;
                         try buffer.appendSlice(alloc, ubuf[0..gn]);
+                        // Part of the base character's cell: extra
+                        // codepoints, no extra columns.
+                        try pushWidth(alloc, widths, 0, 1);
                         cp_count += 1;
                     }
                 }
@@ -331,6 +379,10 @@ pub fn build(
 
     // Close any style run still open at end-of-viewport.
     closeStyle(sink, &cur_style, cp_count);
+
+    // The index alignment `CellWidths` depends on. A drift here would
+    // silently shift every column lookup after the drifting codepoint.
+    if (widths) |w| std.debug.assert(w.items.len == cp_count);
 
     return .{
         .cursor_byte = cursor_offset,
@@ -542,6 +594,53 @@ test "a11y text: rows joined by newline, trailing blanks trimmed" {
     // Row 2 is empty, so it contributes its leading '\n' and nothing else.
     try testing.expectEqualStrings("hello\nworld\n", buffer.items);
     try testing.expectEqual(@as(c_uint, 12), result.cp_count);
+}
+
+test "a11y text: widths report the columns each codepoint covers" {
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 2 });
+    defer t.deinit(alloc);
+
+    // Three double-width characters between narrow ones. The wide cells
+    // each get a spacer the walk skips, so the text is one codepoint per
+    // character while the row is 5 + 6 + 5 columns wide.
+    try t.printString("wide 日本語 tail");
+
+    var sink: TestSink = .{ .alloc = alloc };
+    defer sink.deinit();
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(alloc);
+    var widths: std.ArrayList(u8) = .empty;
+    defer widths.deinit(alloc);
+
+    const result = try build(
+        alloc,
+        &buffer,
+        t.screens.active,
+        &sink,
+        .{ .widths = &widths },
+    );
+
+    // One width per codepoint, or every lookup past the drift is wrong.
+    try testing.expectEqual(@as(usize, result.cp_count), widths.items.len);
+
+    // "wide " then 日本語 then " tail", plus the row separator.
+    try testing.expectEqualSlices(
+        u8,
+        &.{ 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 0 },
+        widths.items,
+    );
+
+    // The payoff: 't' of "tail" is codepoint 9 but column 12. Reading the
+    // codepoint index as a column is what put a routed caret three cells
+    // to the left, inside 語.
+    const t_byte = std.mem.indexOf(u8, buffer.items, "tail").?;
+    const cp_idx = offsets.utf8CpCount(buffer.items[0..t_byte]);
+    try testing.expectEqual(@as(usize, 9), cp_idx);
+    try testing.expectEqual(
+        @as(u32, 12),
+        offsets.cpToGrid(buffer.items, .{ .per_cp = widths.items }, cp_idx).col,
+    );
 }
 
 test "a11y text: intermediate blanks preserved as spaces" {

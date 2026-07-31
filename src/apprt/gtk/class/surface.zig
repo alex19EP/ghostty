@@ -728,6 +728,13 @@ pub const Surface = extern struct {
 
         // Accessibility state for GtkAccessibleText
         ax_cached_text: ?[:0]const u8 = null,
+        // Columns occupied by each codepoint of `ax_cached_text`, filled
+        // by the same walk that builds it. Every conversion between a
+        // codepoint offset and a grid position needs this: a snapshot is
+        // one codepoint per character, but the grid is cells, and a
+        // double-width character spans two of them. Valid exactly when
+        // `ax_cached_text` is non-null; read it through `axCellWidths`.
+        ax_cached_widths: std.ArrayList(u8) = .empty,
         ax_cached_cursor_offset: c_uint = 0,
         ax_active: bool = false,
         // Snapshot of the viewport text at the last `updateContents`
@@ -2200,6 +2207,7 @@ pub const Surface = extern struct {
         }
         priv.ax_style_runs.deinit(std.heap.c_allocator);
         priv.ax_probe_buf.deinit(std.heap.c_allocator);
+        priv.ax_cached_widths.deinit(std.heap.c_allocator);
 
         gobject.Object.virtual_methods.finalize.call(
             Class.parent,
@@ -2899,7 +2907,7 @@ pub const Surface = extern struct {
         const cell_h: f32 = @floatFromInt(core_surface.size.cell.height);
         if (cell_w <= 0 or cell_h <= 0) return 0;
 
-        const rect = a11y_offsets.extentsCells(text, start, end);
+        const rect = a11y_offsets.extentsCells(text, self.axCellWidths(), start, end);
 
         extents.f_origin.f_x = @as(f32, @floatFromInt(rect.col)) * cell_w;
         extents.f_origin.f_y = @as(f32, @floatFromInt(rect.row)) * cell_h;
@@ -2945,8 +2953,24 @@ pub const Surface = extern struct {
             cell_w,
             cell_h,
         );
-        out_offset.* = a11y_offsets.offsetAtGrid(text, grid.row, grid.col);
+        out_offset.* = a11y_offsets.offsetAtGrid(
+            text,
+            self.axCellWidths(),
+            grid.row,
+            grid.col,
+        );
         return 1;
+    }
+
+    /// Cell widths for the current `ax_cached_text`, for the offset math
+    /// that converts between codepoint offsets and grid positions.
+    ///
+    /// Only meaningful after `axRefreshCache` has returned text — the two
+    /// are built together. Callers get `CellWidths.uniform` semantics for
+    /// free if it is empty, so a caller that forgets is off by a column
+    /// per wide character rather than reading out of bounds.
+    fn axCellWidths(self: *Self) a11y_offsets.CellWidths {
+        return .{ .per_cp = self.private().ax_cached_widths.items };
     }
 
     /// Refresh the cached accessibility text from the terminal viewport.
@@ -3013,6 +3037,9 @@ pub const Surface = extern struct {
         defer self.axFinalizeLinksPrev();
         // Style runs are POD; drop them without per-item cleanup.
         priv.ax_style_runs.clearRetainingCapacity();
+        // Widths are rebuilt in lockstep with the text below; `build`
+        // requires an empty list and only appends.
+        priv.ax_cached_widths.clearRetainingCapacity();
 
         var buffer: std.ArrayList(u8) = .empty;
         defer buffer.deinit(alloc);
@@ -3038,7 +3065,10 @@ pub const Surface = extern struct {
                 &buffer,
                 screen,
                 self,
-                .{ .track_links = track_links },
+                .{
+                    .track_links = track_links,
+                    .widths = &priv.ax_cached_widths,
+                },
             ) catch |err| {
                 log.warn("ax text build failed: {}", .{err});
                 return null;
@@ -3429,8 +3459,9 @@ pub const Surface = extern struct {
             const br = sel.bottomRight(screen);
             const tl_vp = screen.pages.pointFromPin(.viewport, tl) orelse break :sel_state no_sel;
             const br_vp = screen.pages.pointFromPin(.viewport, br) orelse break :sel_state no_sel;
-            const s = rowColToCp(new_text, tl_vp.viewport.y, tl_vp.viewport.x) orelse 0;
-            const e_inc = rowColToCp(new_text, br_vp.viewport.y, br_vp.viewport.x) orelse 0;
+            const widths = self.axCellWidths();
+            const s = rowColToCp(new_text, widths, tl_vp.viewport.y, tl_vp.viewport.x) orelse 0;
+            const e_inc = rowColToCp(new_text, widths, br_vp.viewport.y, br_vp.viewport.x) orelse 0;
             break :sel_state SelState{
                 .has = true,
                 .start = @intCast(s),
@@ -3472,6 +3503,48 @@ pub const Surface = extern struct {
             priv.ax_last_selection_end = sel_state.end;
             gtk.AccessibleText.updateSelectionBound(ax_self);
         }
+    }
+
+    /// Cache state displaced by `axAliasOldSnapshot`.
+    const AliasedCache = struct {
+        text: ?[:0]const u8,
+        cursor: c_uint,
+        widths: std.ArrayList(u8),
+    };
+
+    /// Point the cache at the pre-change snapshot for the duration of a
+    /// `.remove` emit.
+    ///
+    /// GTK's AT-SPI bridge fills the event's `any_data` by calling back
+    /// into `axGetContents` synchronously during `updateContents`, and for
+    /// a remove the client expects the *deleted* substring — which the
+    /// cache no longer holds.
+    ///
+    /// The widths go empty rather than following the text: we keep no
+    /// widths for `ax_last_snapshot`, and empty reads as one column per
+    /// codepoint (`CellWidths`), which is both self-consistent and what
+    /// this whole path did before widths existed. Nothing that runs inside
+    /// the window can rebuild the cache — `ax_cached_text` is non-null and
+    /// `ax_cache_stale` was cleared by the refresh that preceded us — so
+    /// the displaced list cannot be appended to behind our back.
+    fn axAliasOldSnapshot(self: *Self) AliasedCache {
+        const priv = self.private();
+        const saved: AliasedCache = .{
+            .text = priv.ax_cached_text,
+            .cursor = priv.ax_cached_cursor_offset,
+            .widths = priv.ax_cached_widths,
+        };
+        priv.ax_cached_text = priv.ax_last_snapshot;
+        priv.ax_cached_cursor_offset = priv.ax_last_notified_caret;
+        priv.ax_cached_widths = .empty;
+        return saved;
+    }
+
+    fn axRestoreCache(self: *Self, saved: AliasedCache) void {
+        const priv = self.private();
+        priv.ax_cached_text = saved.text;
+        priv.ax_cached_cursor_offset = saved.cursor;
+        priv.ax_cached_widths = saved.widths;
     }
 
     /// Prefix/suffix diff: bytes `[0..p)` and `[len-s..)` are unchanged, the
@@ -3520,7 +3593,6 @@ pub const Surface = extern struct {
         new_text: []const u8,
         scroll_k: usize,
     ) void {
-        const priv = self.private();
         const ax_self: *gtk.AccessibleText = @ptrCast(self);
 
         const removed_cp: c_uint = @intCast(utf8CpCount(old_text[0..scroll_k]));
@@ -3531,13 +3603,9 @@ pub const Surface = extern struct {
         // synchronously during the emit, so the cache must point at the
         // pre-remove (old) text for the duration of the call.
         {
-            const saved_cache = priv.ax_cached_text;
-            const saved_cursor = priv.ax_cached_cursor_offset;
-            priv.ax_cached_text = priv.ax_last_snapshot;
-            priv.ax_cached_cursor_offset = priv.ax_last_notified_caret;
+            const saved = self.axAliasOldSnapshot();
+            defer self.axRestoreCache(saved);
             gtk.AccessibleText.updateContents(ax_self, .remove, 0, removed_cp);
-            priv.ax_cached_text = saved_cache;
-            priv.ax_cached_cursor_offset = saved_cursor;
         }
 
         if (new_end_cp > tail_cp) {
@@ -3558,7 +3626,6 @@ pub const Surface = extern struct {
         const removed_len = old_text.len - p - s;
         const inserted_len = new_text.len - p - s;
 
-        const priv = self.private();
         const ax_self: *gtk.AccessibleText = @ptrCast(self);
         const start_cp: c_uint = @intCast(utf8CpCount(old_text[0..p]));
         if (removed_len != 0) {
@@ -3568,14 +3635,10 @@ pub const Surface = extern struct {
             // expects the *deleted* substring — but our cache already
             // holds the post-deletion text. Swap in the old snapshot so
             // the bridge sees the deleted range.
-            const saved_cache = priv.ax_cached_text;
-            const saved_cursor = priv.ax_cached_cursor_offset;
-            priv.ax_cached_text = priv.ax_last_snapshot;
-            priv.ax_cached_cursor_offset = priv.ax_last_notified_caret;
+            const saved = self.axAliasOldSnapshot();
+            defer self.axRestoreCache(saved);
             const end_cp: c_uint = @intCast(utf8CpCount(old_text[0..(old_text.len - s)]));
             gtk.AccessibleText.updateContents(ax_self, .remove, start_cp, end_cp);
-            priv.ax_cached_text = saved_cache;
-            priv.ax_cached_cursor_offset = saved_cursor;
         }
         if (inserted_len != 0) {
             const end_cp: c_uint = @intCast(utf8CpCount(new_text[0..(new_text.len - s)]));
@@ -3744,16 +3807,14 @@ pub const Surface = extern struct {
             0
         else
             @min(offset, text_cp_count - 1);
-        const off_byte = utf8CpToByte(text, off_cp);
 
-        var row: u32 = 0;
-        for (text[0..off_byte]) |ch| {
-            if (ch == '\n') row += 1;
-        }
-
-        var row_start: usize = off_byte;
-        while (row_start > 0 and text[row_start - 1] != '\n') : (row_start -= 1) {}
-        const col: u32 = @intCast(utf8CpCount(text[row_start..off_byte]));
+        // Codepoint offset → grid cell. Not a codepoint count into the
+        // row: a double-width character earlier on the row takes two
+        // columns, and clicking as though it took one lands on the wrong
+        // word (see `a11y_offsets.CellWidths`).
+        const cell = a11y_offsets.cpToGrid(text, self.axCellWidths(), off_cp);
+        const row = cell.row;
+        const col = cell.col;
 
         const cell_w: f32 = @floatFromInt(core_surface.size.cell.width);
         const cell_h: f32 = @floatFromInt(core_surface.size.cell.height);
@@ -3865,16 +3926,18 @@ pub const Surface = extern struct {
         const br_row: u32 = br_pt.viewport.y;
         const br_col: u32 = br_pt.viewport.x;
 
-        // Convert (row, col) to codepoint offsets in the snapshot.
-        // Same mapping as `axGetExtents` / `axSetCaretPosition`: each
-        // viewport row is delimited by '\n'; one codepoint per cell.
-        const start_cp = rowColToCp(text, tl_row, tl_col) orelse {
+        // Convert (row, col) to codepoint offsets in the snapshot. Same
+        // mapping as `axGetExtents` / `axSetCaretPosition`: each viewport
+        // row is delimited by '\n', and `axCellWidths` says how many
+        // columns each codepoint on it covers.
+        const widths = self.axCellWidths();
+        const start_cp = rowColToCp(text, widths, tl_row, tl_col) orelse {
             n_ranges.* = 0;
             return 0;
         };
         // End is inclusive on the cell; AT-SPI range length is exclusive,
         // so add 1 to cover the last cell.
-        const end_cp_inclusive = rowColToCp(text, br_row, br_col) orelse {
+        const end_cp_inclusive = rowColToCp(text, widths, br_row, br_col) orelse {
             n_ranges.* = 0;
             return 0;
         };
@@ -3944,10 +4007,11 @@ pub const Surface = extern struct {
         if (end_cp_exclusive <= start_cp) return 0;
         const end_cp_inclusive: usize = end_cp_exclusive - 1;
 
-        // Map codepoint offsets → (row, col). Inverse of
-        // `rowColToCp`, mirroring `axSetCaretPosition` at line ~3681.
-        const start_rc = cpToRowCol(text, start_cp);
-        const end_rc = cpToRowCol(text, end_cp_inclusive);
+        // Map codepoint offsets → (row, col). Inverse of `rowColToCp`,
+        // the same conversion `axSetCaretPosition` uses.
+        const widths = self.axCellWidths();
+        const start_rc = a11y_offsets.cpToGrid(text, widths, start_cp);
+        const end_rc = a11y_offsets.cpToGrid(text, widths, end_cp_inclusive);
 
         core_surface.renderer_state.mutex.lockUncancelable(global.io());
         const screen: *terminal.Screen = core_surface.renderer_state.terminal.screens.active;
@@ -3987,21 +4051,6 @@ pub const Surface = extern struct {
         // release above is what unblocks it.
         self.redraw();
         return 1;
-    }
-
-    /// Inverse of `rowColToCp` — map a codepoint offset into snapshot
-    /// text back to (row, col). Rows are '\n'-delimited; one codepoint
-    /// per cell (see `axRefreshCache`).
-    fn cpToRowCol(text: []const u8, cp_idx: usize) struct { row: u32, col: u32 } {
-        const byte_idx = utf8CpToByte(text, cp_idx);
-        var row: u32 = 0;
-        for (text[0..byte_idx]) |ch| {
-            if (ch == '\n') row += 1;
-        }
-        var row_start: usize = byte_idx;
-        while (row_start > 0 and text[row_start - 1] != '\n') : (row_start -= 1) {}
-        const col: u32 = @intCast(utf8CpCount(text[row_start..byte_idx]));
-        return .{ .row = row, .col = col };
     }
 
     /// Emit per-character SGR attributes at `offset`.
