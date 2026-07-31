@@ -57,4 +57,5 @@ test {
     _ = runtime;
     _ = action;
     _ = structs;
+    _ = @import("apprt/a11y_text.zig");
 }
