@@ -88,6 +88,10 @@ pub const RenderState = struct {
     /// Cursor state within the viewport.
     cursor: Cursor,
 
+    /// Caret position within the viewport. Null when caret mode is inactive
+    /// or the caret is scrolled out of view.
+    caret: ?Cursor.Viewport = null,
+
     /// The rows (y=0 is top) of the viewport. Guaranteed to be `rows` length.
     ///
     /// This is a MultiArrayList because only the update cares about
@@ -429,6 +433,7 @@ pub const RenderState = struct {
         // probably cache this by comparing the cursor pin and viewport pin
         // but may not be worth it.
         self.cursor.viewport = null;
+        self.caret = null;
 
         // Colors.
         self.colors.cursor = t.colors.cursor.get();
@@ -568,6 +573,25 @@ pub const RenderState = struct {
                     // up rather than calling this.
                     .wide_tail = if (s.cursor.x > 0)
                         s.cursorCellLeft(1).wide == .wide
+                    else
+                        false,
+                };
+            }
+
+            // Find the caret the same way, if caret mode is active. This is
+            // deliberately a separate block from the cursor above: the caret
+            // roams under keyboard control while the terminal cursor stays
+            // wherever the shell left it, so the two are rarely on the same
+            // row and neither lookup can stand in for the other.
+            if (s.caret_mode and self.caret == null) caret: {
+                const cp = s.caret_pin orelse break :caret;
+                if (node != cp.node) break :caret;
+                if (cp.y < chunk.start or cp.y >= chunk.start + take) break :caret;
+                self.caret = .{
+                    .y = @intCast(y + (cp.y - chunk.start)),
+                    .x = cp.x,
+                    .wide_tail = if (cp.x > 0)
+                        cp.rowAndCell().cell.wide == .spacer_tail
                     else
                         false,
                 };
