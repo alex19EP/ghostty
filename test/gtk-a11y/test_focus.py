@@ -1,10 +1,11 @@
 """What focus does to the two paths an AT client uses.
 
-Change events (`object:text-changed`) are pushed from the render callback and
-are currently gated on the surface being focused. On-demand reads (flat
-review, caret and text queries) go through the GtkAccessibleText vfuncs and
-are not gated at all. The two must not be confused: a surface can be silent
-and still answer correctly when asked.
+Change events (`object:text-changed`) are pushed from the render callback.
+On-demand reads (flat review, caret and text queries) go through the
+GtkAccessibleText vfuncs. Neither is gated on focus any more, but the two
+have different failure modes and must not be confused: a surface can be
+silent and still answer correctly when asked, which is what makes a lost
+push path so easy to miss.
 
 The invariant these tests defend is *recovery*. A surface that stops
 announcing when it loses focus and never starts again is silent for the rest
@@ -13,10 +14,11 @@ only a client watching over time can tell. That is the same class of bug as
 the viewport re-announcement in test_scroll.py, and it is why these assert
 over a focus round trip rather than a single state.
 
-Deliberately not asserted: that an unfocused surface emits *nothing*. That is
-current policy, not a requirement — see the note in `glareaRender` — and
-pinning it here would make a deliberate change to that policy look like a
-regression. The tests report what they saw instead.
+Deliberately not asserted: how much an unfocused surface emits. That is
+policy rather than a requirement — it was nothing while `glareaRender` had a
+focus gate and is now the same as any other surface — and pinning it here
+would make a deliberate change look like a regression. The tests report what
+they saw instead.
 """
 
 from __future__ import annotations
