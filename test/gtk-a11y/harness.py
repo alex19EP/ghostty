@@ -325,9 +325,13 @@ class Session:
     def focus(self) -> None:
         """Give the toplevel X input focus.
 
-        Required, not cosmetic: `axNotifyIfChanged` is gated on the surface
-        being focused, so an unfocused window emits no change events at all.
-        There is no window manager under Xvfb, hence the explicit XSetInputFocus.
+        Required for input, not cosmetic: `type_text` and `send_key` go
+        through XTEST, which delivers to whichever window holds focus. There
+        is no window manager under Xvfb, hence the explicit XSetInputFocus.
+
+        Change events no longer depend on this — `glareaRender` dropped its
+        focus gate — so a test that only reads or only listens does not need
+        to call it. See test_focus.py.
 
         Every session shares INSTANCE_NAME, so the xdotool search cannot tell
         two of them apart. Resolve the window once and remember it: without
