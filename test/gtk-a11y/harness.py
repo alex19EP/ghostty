@@ -112,6 +112,24 @@ link-url = true
 # exercises it. F9/F10 are unbound both here and in the pty behind the tests.
 keybind = f9=scroll_page_lines:-1
 keybind = f10=scroll_page_lines:1
+
+# Keyboard selection, for test_keyboard_selection.py. Ghostty ships no default
+# binding for `start_selection` — the shift+arrow binds that *extend* a
+# selection are defaults and need no help here, which is the whole point of the
+# action. F8 is unbound both here and in the pty behind the tests.
+keybind = f8=start_selection
+
+# Caret mode, for test_caret_mode.py. `enter_caret_mode` has no default
+# binding either; once inside, the built-in "caret" key table supplies the
+# movement keys, so F7 is the only one the harness has to provide.
+keybind = f7=enter_caret_mode
+
+# Link activation, for test_link_activation.py. Marked `performable` so the
+# binding reports whether it found a link: on a hit it is consumed and nothing
+# reaches the pty, on a miss it falls through and `cat` echoes F6's escape
+# sequence into the viewport. That echo is the only way a test can observe
+# link *detection* without actually launching a browser.
+keybind = performable:f6=open_link
 """
 
 
