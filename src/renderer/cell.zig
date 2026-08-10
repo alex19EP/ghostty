@@ -104,9 +104,11 @@ pub const Contents = struct {
         // can produce arbitrarily many glyphs in one column.
         const fg_row_capacity = @as(usize, size.columns) * 3;
 
-        // The cursor lists need just one cell. The rest get the full capacity.
+        // The cursor lists need just one cell, except the trailing list which
+        // also holds the caret glyph alongside a non-block cursor. The rest
+        // get the full capacity.
         fg_rows[0] = try .initCapacity(alloc, 1);
-        fg_rows[row_count + 1] = try .initCapacity(alloc, 1);
+        fg_rows[row_count + 1] = try .initCapacity(alloc, 2);
         for (fg_rows[1 .. row_count + 1]) |*row| {
             row.* = try .initCapacity(alloc, fg_row_capacity);
         }
@@ -151,6 +153,14 @@ pub const Contents = struct {
             // Other cursor styles should be drawn last
             .block_hollow, .bar, .underline, .lock => self.fg_rows[self.size.rows + 1].appendAssumeCapacity(cell),
         }
+    }
+
+    /// Set the caret (keyboard navigation) glyph. Unlike setCursor, this does
+    /// not clear any existing cursor glyphs — it appends alongside them.
+    /// The caret is always drawn last (on top of text).
+    pub fn setCaret(self: *Contents, v: shaderpkg.CellText) void {
+        if (self.size.rows == 0) return;
+        self.fg_rows[self.size.rows + 1].appendAssumeCapacity(v);
     }
 
     /// Returns the current cursor glyph if present, checking both cursor lists.
