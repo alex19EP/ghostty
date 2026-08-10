@@ -363,3 +363,127 @@ def test_v_selection_keeps_following_plain_movement(session):
     session.send_key("v")
     time.sleep(0.3)
     assert selected(session) is None, "second 'v' did not clear the selection"
+
+
+def word_at(session, offset: int) -> str:
+    """The whitespace-delimited word containing `offset`."""
+    text = session.text()
+    start = max(text.rfind(" ", 0, offset), text.rfind("\n", 0, offset)) + 1
+    ends = [i for i in (text.find(" ", offset), text.find("\n", offset)) if i != -1]
+    return text[start : min(ends) if ends else len(text)]
+
+
+def test_ctrl_arrow_moves_the_caret_by_words(session):
+    """Word navigation, in the keystroke shape Orca reads best.
+
+    Orca classifies ctrl+arrow as word navigation and announces the word
+    landed on, where the vim letters are classified as typing and stay
+    silent -- they reach braille but not speech. So this is the binding
+    that decides whether word movement is usable by ear at all, and it has
+    to emit a caret-moved event like plain movement does: there is no
+    selection here to carry the news instead.
+    """
+    session.send_key("ctrl+Home")
+    time.sleep(0.3)
+
+    landed = []
+    with harness.Events("object:text-caret-moved") as events:
+        for _ in range(3):
+            session.send_key("ctrl+Right")
+            time.sleep(0.2)
+            landed.append(word_at(session, caret(session)))
+        events.pump(2.0)
+
+    print(f"\n  ctrl+Right x3 landed in: {landed}")
+    print(f"  caret-moved events: {len(events.records)}")
+
+    assert landed == ["alpha", "bravo", "charlie"], (
+        f"ctrl+Right did not walk the words of {FIRST_ROW!r} one at a time; "
+        f"landed in {landed}"
+    )
+    assert events.records, (
+        "the caret moved by word but no object:text-caret-moved was emitted, "
+        "so Orca never learns about it"
+    )
+
+
+def test_word_movement_crosses_the_end_of_a_line(session):
+    """Word movement must not dead-end at the end of every line.
+
+    A selection stops at a hard line break, which is right for a selection
+    but strands a caret: the key would stop working at the end of each row,
+    leaving the user pressing it with nothing to hear. That is the dead end
+    plain Right used to have, and it must not come back by another door.
+    """
+    session.send_key("ctrl+Home")
+    session.send_key("End")
+    time.sleep(0.4)
+    before = line_at(session, caret(session))
+
+    session.send_key("ctrl+Right")
+    time.sleep(0.3)
+    after = line_at(session, caret(session))
+    word = word_at(session, caret(session))
+
+    assert after != before, (
+        f"ctrl+Right at the end of {before!r} stayed on that line; word "
+        f"movement is stuck at the line break"
+    )
+    assert word == "delta", (
+        f"crossing the line break should land on the first word of the next "
+        f"row, not {word!r}"
+    )
+
+
+def test_ctrl_shift_arrow_selects_by_words(session):
+    """Selecting a word at a time, the counterpart to the movement above."""
+    session.send_key("ctrl+Home")
+    time.sleep(0.3)
+    assert Atspi.Text.get_n_selections(session.terminal) == 0, (
+        "a selection already existed, so this proves nothing"
+    )
+
+    with harness.Events("object:text-selection-changed") as events:
+        session.send_key("ctrl+shift+Right")
+        time.sleep(0.25)
+        first = selected(session)
+        session.send_key("ctrl+shift+Right")
+        time.sleep(0.25)
+        second = selected(session)
+        events.pump(2.0)
+
+    print(f"\n  ctrl+shift+Right: {first!r} -> {second!r}")
+
+    assert first is not None, "ctrl+shift+Right produced no selection"
+    # A whole word, not a single cell -- and still within the first word,
+    # whichever way the inclusive end maps to an AT-SPI offset.
+    assert len(first) >= 4 and " " not in first, (
+        f"the first press did not select a word (got {first!r})"
+    )
+    assert second is not None and " " in second and len(second) > len(first), (
+        f"the second press did not extend by another word: {first!r} -> "
+        f"{second!r}"
+    )
+    assert events.records, "word selection was not announced"
+
+
+def test_vim_word_keys_move_the_caret(session):
+    """`b` and `e` mean what they do in vim, and are swallowed like hjkl."""
+    session.send_key("ctrl+Home")
+    session.send_key("End")
+    time.sleep(0.4)
+    text_before = session.text()
+
+    session.send_key("b")
+    time.sleep(0.3)
+    back = word_at(session, caret(session))
+
+    session.send_key("e")
+    time.sleep(0.3)
+    forward = word_at(session, caret(session))
+
+    assert back == "charlie", f"`b` from the end of the line landed in {back!r}"
+    assert forward == "charlie", f"`e` landed in {forward!r}"
+    assert session.text() == text_before, (
+        "`b`/`e` reached the pty instead of being swallowed by caret mode"
+    )

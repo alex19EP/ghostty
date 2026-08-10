@@ -544,7 +544,8 @@ pub const Action = union(enum) {
     ///
     /// Valid arguments are the same as `adjust_selection`:
     /// `left`, `right`, `up`, `down`, `page_up`, `page_down`,
-    /// `home`, `end`, `beginning_of_line`, `end_of_line`.
+    /// `home`, `end`, `beginning_of_line`, `end_of_line`,
+    /// `word_left`, `word_right`.
     move_caret: MoveCaret,
 
     /// Toggle a selection anchored at the caret position. If no selection
@@ -1133,6 +1134,8 @@ pub const Action = union(enum) {
         end,
         beginning_of_line,
         end_of_line,
+        word_left,
+        word_right,
     };
 
     pub const SplitDirection = enum {

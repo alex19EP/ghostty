@@ -4439,6 +4439,8 @@ fn caretMove(
         .end => .end,
         .beginning_of_line => .beginning_of_line,
         .end_of_line => .end_of_line,
+        .word_left => .word_left,
+        .word_right => .word_right,
     }, self.config.selection_word_chars);
 
     // Scroll the viewport to keep the caret in view.
