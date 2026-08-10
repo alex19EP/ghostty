@@ -475,11 +475,30 @@ pub const Action = union(enum) {
     /// lines.
     scroll_page_lines: i16,
 
+    /// Start a new selection at the current cursor position.
+    ///
+    /// The selection starts as the single cell under the cursor. That cell
+    /// is the anchor: `adjust_selection` only ever moves the other end, so
+    /// the default `shift` + arrow, `home`, `end` and page keybinds extend
+    /// the selection outwards from the cursor without any further
+    /// configuration. The selection may grow in either direction, so
+    /// `shift`+`up` from the prompt reaches back into the scrollback.
+    ///
+    /// If a selection already exists it is replaced, re-anchoring on the
+    /// cursor, which makes this binding idempotent. To clear a selection
+    /// without starting a new one, press `escape`.
+    ///
+    /// Note this always anchors on the cursor, which is wherever the shell
+    /// left it. If the viewport has been scrolled away from the cursor, the
+    /// new selection is created off-screen.
+    start_selection,
+
     /// Adjust the current selection in the given direction or position,
     /// relative to the cursor.
     ///
     /// WARNING: This does not create a new selection, and does nothing when
-    /// there currently isn't one.
+    /// there currently isn't one. Use `start_selection` to create one from
+    /// the keyboard.
     ///
     /// Valid arguments are:
     ///
@@ -506,6 +525,49 @@ pub const Action = union(enum) {
     ///     respectively.
     ///
     adjust_selection: AdjustSelection,
+
+    /// Enter caret (keyboard navigation) mode. The caret is placed at the
+    /// current terminal cursor position. Also pushes the "caret" key table.
+    /// No-op if caret mode is already active.
+    enter_caret_mode,
+
+    /// Exit caret mode. Also pops the "caret" key table.
+    exit_caret_mode,
+
+    /// Move the caret in caret mode. No-op if caret mode is not active.
+    ///
+    /// Valid arguments are the same as `adjust_selection`:
+    /// `left`, `right`, `up`, `down`, `page_up`, `page_down`,
+    /// `home`, `end`, `beginning_of_line`, `end_of_line`.
+    move_caret: MoveCaret,
+
+    /// Toggle a selection anchored at the caret position. If no selection
+    /// exists, one is created at the current caret. If a selection exists,
+    /// it is cleared. No-op if caret mode is not active.
+    toggle_caret_selection,
+
+    /// Move the caret, extending the selection as it goes. If no selection
+    /// exists yet, one is anchored at the caret first, so a single keypress
+    /// both starts and extends — this is what `shift` + arrow does in an
+    /// ordinary text widget.
+    ///
+    /// This exists as its own action rather than a key sequence because
+    /// `start_selection` deliberately re-anchors when a selection already
+    /// exists, so pairing the two would collapse the selection on every
+    /// press instead of growing it.
+    ///
+    /// Takes the same arguments as `move_caret`. No-op if caret mode is not
+    /// active.
+    move_caret_select: MoveCaret,
+
+    /// Open the link under the caret, or under the terminal cursor when
+    /// caret mode is not active. Does nothing if there is no link there.
+    ///
+    /// This covers both OSC 8 hyperlinks and configured `link` regexes, and
+    /// unlike clicking it ignores any modifier requirements those links
+    /// carry: a deliberate keypress is not ambiguous the way a mouse
+    /// movement over text is.
+    open_link,
 
     /// Jump the viewport forward or back by the given number of prompts.
     ///
@@ -1052,6 +1114,19 @@ pub const Action = union(enum) {
         end_of_line,
     };
 
+    pub const MoveCaret = enum {
+        left,
+        right,
+        up,
+        down,
+        page_up,
+        page_down,
+        home,
+        end,
+        beginning_of_line,
+        end_of_line,
+    };
+
     pub const SplitDirection = enum {
         right,
         down,
@@ -1416,7 +1491,14 @@ pub const Action = union(enum) {
             .scroll_page_down,
             .scroll_page_fractional,
             .scroll_page_lines,
+            .start_selection,
             .adjust_selection,
+            .enter_caret_mode,
+            .exit_caret_mode,
+            .move_caret,
+            .toggle_caret_selection,
+            .move_caret_select,
+            .open_link,
             .jump_to_prompt,
             .write_scrollback_file,
             .write_screen_file,
@@ -2881,6 +2963,24 @@ pub const Set = struct {
         };
     }
 };
+
+test "parse: start_selection" {
+    const testing = std.testing;
+
+    try testing.expectEqual(Binding{
+        .trigger = .{
+            .mods = .{ .ctrl = true, .shift = true },
+            .key = .{ .unicode = 'v' },
+        },
+        .action = .start_selection,
+    }, try parseSingle("ctrl+shift+v=start_selection"));
+
+    // It takes no argument, unlike its `adjust_selection` counterpart.
+    try testing.expectError(
+        Error.InvalidFormat,
+        parseSingle("ctrl+shift+v=start_selection:left"),
+    );
+}
 
 test "parse: triggers" {
     const testing = std.testing;

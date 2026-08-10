@@ -6741,6 +6741,80 @@ pub const Keybinds = struct {
             .{ .performable = true },
         );
 
+        // Built-in "caret" key table for keyboard-driven scrollback navigation.
+        // Users activate it by binding `enter_caret_mode` to a key.
+        {
+            const gop = try self.tables.getOrPut(alloc, "caret");
+            if (!gop.found_existing) {
+                gop.key_ptr.* = "caret";
+                gop.value_ptr.* = .{};
+            }
+            const t = gop.value_ptr;
+
+            // Line movement
+            try t.put(alloc, .{ .key = .{ .unicode = 'j' } }, .{ .move_caret = .down });
+            try t.put(alloc, .{ .key = .{ .unicode = 'k' } }, .{ .move_caret = .up });
+            try t.put(alloc, .{ .key = .{ .unicode = 'h' } }, .{ .move_caret = .left });
+            try t.put(alloc, .{ .key = .{ .unicode = 'l' } }, .{ .move_caret = .right });
+
+            // Arrow key movement
+            try t.put(alloc, .{ .key = .{ .physical = .arrow_up } }, .{ .move_caret = .up });
+            try t.put(alloc, .{ .key = .{ .physical = .arrow_down } }, .{ .move_caret = .down });
+            try t.put(alloc, .{ .key = .{ .physical = .arrow_left } }, .{ .move_caret = .left });
+            try t.put(alloc, .{ .key = .{ .physical = .arrow_right } }, .{ .move_caret = .right });
+
+            // Page movement
+            try t.put(alloc, .{ .key = .{ .physical = .page_up } }, .{ .move_caret = .page_up });
+            try t.put(alloc, .{ .key = .{ .physical = .page_down } }, .{ .move_caret = .page_down });
+            try t.put(alloc, .{ .key = .{ .unicode = 'd' }, .mods = .{ .ctrl = true } }, .{ .move_caret = .page_down });
+            try t.put(alloc, .{ .key = .{ .unicode = 'u' }, .mods = .{ .ctrl = true } }, .{ .move_caret = .page_up });
+            try t.put(alloc, .{ .key = .{ .unicode = 'f' }, .mods = .{ .ctrl = true } }, .{ .move_caret = .page_down });
+            try t.put(alloc, .{ .key = .{ .unicode = 'b' }, .mods = .{ .ctrl = true } }, .{ .move_caret = .page_up });
+
+            // Jump to top/bottom
+            t.parseAndPut(alloc, "g>g=move_caret:home") catch unreachable;
+            try t.put(alloc, .{ .key = .{ .unicode = 'G' }, .mods = .{ .shift = true } }, .{ .move_caret = .end });
+            try t.put(alloc, .{ .key = .{ .unicode = '0' } }, .{ .move_caret = .beginning_of_line });
+            try t.put(alloc, .{ .key = .{ .unicode = '$' }, .mods = .{ .shift = true } }, .{ .move_caret = .end_of_line });
+
+            // Search
+            try t.put(alloc, .{ .key = .{ .unicode = '/' } }, .start_search);
+            try t.put(alloc, .{ .key = .{ .unicode = 'n' } }, .{ .navigate_search = .next });
+            try t.put(alloc, .{ .key = .{ .unicode = 'N' }, .mods = .{ .shift = true } }, .{ .navigate_search = .previous });
+
+            // Selection
+            try t.put(alloc, .{ .key = .{ .unicode = 'v' } }, .toggle_caret_selection);
+            try t.put(alloc, .{ .key = .{ .unicode = 'y' } }, .{ .copy_to_clipboard = .mixed });
+
+            // Shift + movement selects, as it does in any text widget and as
+            // it already does outside caret mode via `adjust_selection`. The
+            // `catch_all` below would otherwise swallow these, leaving `v`
+            // as the only way to start a selection — which assumes vim
+            // conventions the user may not know. This is also the keystroke
+            // shape screen readers classify best: Orca treats shift + arrow
+            // as caret selection and announces what was selected.
+            try t.put(alloc, .{ .key = .{ .physical = .arrow_up }, .mods = .{ .shift = true } }, .{ .move_caret_select = .up });
+            try t.put(alloc, .{ .key = .{ .physical = .arrow_down }, .mods = .{ .shift = true } }, .{ .move_caret_select = .down });
+            try t.put(alloc, .{ .key = .{ .physical = .arrow_left }, .mods = .{ .shift = true } }, .{ .move_caret_select = .left });
+            try t.put(alloc, .{ .key = .{ .physical = .arrow_right }, .mods = .{ .shift = true } }, .{ .move_caret_select = .right });
+            try t.put(alloc, .{ .key = .{ .physical = .home }, .mods = .{ .shift = true } }, .{ .move_caret_select = .beginning_of_line });
+            try t.put(alloc, .{ .key = .{ .physical = .end }, .mods = .{ .shift = true } }, .{ .move_caret_select = .end_of_line });
+            try t.put(alloc, .{ .key = .{ .physical = .page_up }, .mods = .{ .shift = true } }, .{ .move_caret_select = .page_up });
+            try t.put(alloc, .{ .key = .{ .physical = .page_down }, .mods = .{ .shift = true } }, .{ .move_caret_select = .page_down });
+
+            // Activate whatever the caret is on. Without this, links are
+            // announced but unreachable from the keyboard.
+            try t.put(alloc, .{ .key = .{ .physical = .enter } }, .open_link);
+
+            // Exit
+            try t.put(alloc, .{ .key = .{ .physical = .escape } }, .exit_caret_mode);
+            try t.put(alloc, .{ .key = .{ .unicode = 'q' } }, .exit_caret_mode);
+            try t.put(alloc, .{ .key = .{ .unicode = 'i' } }, .exit_caret_mode);
+
+            // Swallow all unbound keys so they don't reach the terminal.
+            t.parseAndPut(alloc, "catch_all=ignore") catch unreachable;
+        }
+
         // Tabs common to all platforms
         try self.set.put(
             alloc,
@@ -8111,8 +8185,14 @@ pub const Keybinds = struct {
         // Reset to defaults (empty value)
         try keybinds.parseCLI(alloc, "");
 
-        // Tables should be cleared, root set has defaults
-        try testing.expectEqual(0, keybinds.tables.count());
+        // The user's tables are gone. "caret" survives because it ships as
+        // part of the defaults, so a reset restores it rather than clearing
+        // it — the thing being asserted is that user tables don't outlive a
+        // reset, not that the map ends up empty.
+        try testing.expectEqual(1, keybinds.tables.count());
+        try testing.expect(keybinds.tables.contains("caret"));
+        try testing.expect(!keybinds.tables.contains("foo"));
+        try testing.expect(!keybinds.tables.contains("bar"));
         try testing.expect(keybinds.set.bindings.count() > 0);
     }
 };
