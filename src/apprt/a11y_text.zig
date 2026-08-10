@@ -108,7 +108,23 @@ pub fn build(
     const pages = &screen.pages;
     const viewport_rows: usize = pages.rows;
 
-    const cursor = screen.cursor;
+    // Where the AT-SPI caret belongs. In caret mode the user is driving the
+    // keyboard caret and the terminal cursor is irrelevant to them, so the
+    // caret is what an assistive client has to be told about — it is the only
+    // signal that anything moved, because navigating without selecting emits
+    // no selection change at all. Outside caret mode the two are the same.
+    //
+    // Null when the position isn't in the viewport (scrolled away), which
+    // leaves `cursor_byte` null exactly as it was before caret mode existed.
+    const cursor: ?struct { x: usize, y: usize } = cursor: {
+        if (screen.caret_mode) {
+            const pin = screen.caret_pin orelse break :cursor null;
+            const pt = pages.pointFromPin(.viewport, pin.*) orelse
+                break :cursor null;
+            break :cursor .{ .x = pt.viewport.x, .y = pt.viewport.y };
+        }
+        break :cursor .{ .x = screen.cursor.x, .y = screen.cursor.y };
+    };
     var cursor_offset: ?c_uint = null;
 
     // Codepoint counter tracked alongside `buffer.items.len`. Used to
@@ -186,7 +202,7 @@ pub fn build(
         }
 
         const pin = row_it.next() orelse continue;
-        const is_cursor_row = row_idx == cursor.y;
+        const is_cursor_row = if (cursor) |c| row_idx == c.y else false;
         const row_start: c_uint = @intCast(buffer.items.len);
         if (is_cursor_row) cursor_offset = row_start;
 
@@ -212,7 +228,7 @@ pub fn build(
             // cursor.x, so the offset points AT that cell. For blank cells
             // we defer: capture the blank-run index and resolve on flush
             // or end-of-row.
-            if (is_cursor_row and col == cursor.x) {
+            if (is_cursor_row and col == cursor.?.x) {
                 if (cell.hasText()) {
                     cursor_offset = @intCast(buffer.items.len);
                 } else {
@@ -356,7 +372,7 @@ pub fn build(
 
         // If cursor.x is past the last column we emitted (trailing blanks,
         // or cursor beyond row end), anchor to end-of-row.
-        if (is_cursor_row and cursor.x >= cells.len) {
+        if (is_cursor_row and cursor.?.x >= cells.len) {
             cursor_offset = @intCast(buffer.items.len);
         }
 
