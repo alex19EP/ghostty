@@ -510,6 +510,57 @@ pub fn adjust(
     }
 }
 
+test "Selection: a cursor-anchored selection grows in both directions" {
+    // The contract the `start_selection` binding relies on: a degenerate
+    // selection pinned to the cursor cell, which `adjust_selection` then
+    // extends. Both directions matter, because the cursor sits at the
+    // prompt — growing *upwards* is how a keyboard user reaches the output
+    // above it, and that only works if the anchor stays put while the end
+    // travels past it.
+    const testing = std.testing;
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 5, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("A1\nB2\nC3\nD4\nE5");
+
+    // Anchor on the cursor exactly as `performBindingAction` does.
+    s.cursorAbsolute(1, 3);
+    const cursor_pin = s.cursor.page_pin.*;
+    var sel = Selection.init(cursor_pin, cursor_pin, false);
+    defer sel.deinit(&s);
+
+    // A fresh selection is the single cell under the cursor.
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 1,
+        .y = 3,
+    } }, s.pages.pointFromPin(.screen, sel.start()).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 1,
+        .y = 3,
+    } }, s.pages.pointFromPin(.screen, sel.end()).?);
+
+    // Extending upwards runs the selection backwards over earlier output.
+    sel.adjust(&s, .up);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 1,
+        .y = 2,
+    } }, s.pages.pointFromPin(.screen, sel.end()).?);
+
+    // Coming back down travels through the anchor and out the other side,
+    // so one binding covers text both above and below the cursor.
+    sel.adjust(&s, .down);
+    sel.adjust(&s, .down);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 1,
+        .y = 4,
+    } }, s.pages.pointFromPin(.screen, sel.end()).?);
+
+    // Through all of that the anchor never moved.
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 1,
+        .y = 3,
+    } }, s.pages.pointFromPin(.screen, sel.start()).?);
+}
+
 test "Selection: adjust right" {
     const testing = std.testing;
     var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 10, .rows = 10, .max_scrollback_bytes = 0 });

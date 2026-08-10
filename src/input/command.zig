@@ -244,10 +244,22 @@ fn actionCommands(action: Action.Key) []const Command {
             .description = i18n.N_("Clear the screen and scrollback."),
         }},
 
+        .open_link => comptime &.{.{
+            .action = .open_link,
+            .title = i18n.N_("Open Link Under Caret"),
+            .description = i18n.N_("Open the link under the caret, or under the terminal cursor outside caret mode."),
+        }},
+
         .select_all => comptime &.{.{
             .action = .select_all,
             .title = i18n.N_("Select All"),
             .description = i18n.N_("Select all text on the screen."),
+        }},
+
+        .start_selection => comptime &.{.{
+            .action = .start_selection,
+            .title = i18n.N_("Start Selection"),
+            .description = i18n.N_("Start a new selection at the cursor position."),
         }},
 
         .scroll_to_top => comptime &.{.{
@@ -725,6 +737,11 @@ fn actionCommands(action: Action.Key) []const Command {
         .scroll_page_fractional,
         .scroll_page_lines,
         .adjust_selection,
+        .enter_caret_mode,
+        .exit_caret_mode,
+        .move_caret,
+        .move_caret_select,
+        .toggle_caret_selection,
         .jump_to_prompt,
         .write_scrollback_file,
         .goto_tab,
