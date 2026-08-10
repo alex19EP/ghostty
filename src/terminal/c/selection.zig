@@ -330,7 +330,16 @@ pub fn adjust(
     const t = terminal_c.zigTerminal(terminal) orelse return .invalid_value;
     const sel_ptr = selection orelse return .invalid_value;
     var sel = sel_ptr.toZig() orelse return .invalid_value;
-    sel.adjust(t.screens.active, adjustment);
+
+    // The word adjustments need a word boundary set, and this entrypoint
+    // has no options struct to carry a caller-supplied one. Use the same
+    // defaults `select_word` falls back to; a variant taking custom
+    // boundaries can be added without breaking this signature.
+    sel.adjust(
+        t.screens.active,
+        adjustment,
+        &selection_codepoints.default_word_boundaries,
+    );
     sel_ptr.* = .fromZig(sel);
     return .success;
 }
