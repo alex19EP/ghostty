@@ -68,6 +68,23 @@ caret_mode: bool = false,
 /// pin so it stays valid as the buffer scrolls. Null when caret_mode is false.
 caret_pin: ?*Pin = null,
 
+/// Whether the active selection keeps following the caret once the keys
+/// that started it are released.
+///
+/// The two idioms for keyboard selection disagree about what an unmodified
+/// arrow key means, and caret mode offers both. A selection started with
+/// `toggle_caret_selection` is vim's visual mode: it is sticky, and plain
+/// movement keeps extending it until you end it. A selection started with
+/// `move_caret_select` is the text-widget idiom that Windows Terminal's
+/// mark mode also follows: shift extends, and releasing shift means plain
+/// movement collapses the selection.
+///
+/// Without this distinction one of the two is always wrong. Extending
+/// unconditionally means shift+arrow users keep selecting after letting go
+/// of shift, which has no precedent anywhere; never extending makes
+/// `toggle_caret_selection` useless.
+caret_selection_sticky: bool = false,
+
 /// The charset state
 charset: CharsetState = .{},
 
@@ -2938,6 +2955,7 @@ pub fn enterCaretMode(self: *Screen) Allocator.Error!void {
     const tracked = try self.pages.trackPin(self.cursor.page_pin.*);
     self.caret_pin = tracked;
     self.caret_mode = true;
+    self.caret_selection_sticky = false;
     self.dirty.caret = true;
 }
 
@@ -2950,6 +2968,7 @@ pub fn exitCaretMode(self: *Screen) void {
         self.caret_pin = null;
     }
     self.caret_mode = false;
+    self.caret_selection_sticky = false;
     self.dirty.caret = true;
     self.clearSelection();
 }
