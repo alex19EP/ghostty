@@ -1,0 +1,209 @@
+"""Caret mode as a screen reader experiences it.
+
+Caret mode gives the keyboard a cursor that roams independently of the
+terminal cursor, so a user can navigate to output already on screen and
+select from there. `test_keyboard_selection.py` covers the case where the
+anchor is the terminal cursor; this covers the case where it moves.
+
+The reason this module exists is a failure mode with no visual symptom at
+all. Moving the caret without selecting produces *no selection*, so it emits
+no `object:text-selection-changed` — the channel every assertion in
+`test_keyboard_selection.py` relies on. If the AT-SPI caret does not follow
+the roaming caret, then a sighted user sees a block cursor gliding around the
+scrollback while a screen reader user hears nothing whatsoever, and every
+Zig-level test still passes because the text is unchanged.
+
+So `test_moving_the_caret_moves_the_at_spi_caret` is the load-bearing test
+here. The upstream implementation this is built on (ghostty#12326) touches no
+apprt files at all, which is precisely the bug these tests exist to prevent.
+"""
+
+from __future__ import annotations
+
+import time
+
+import gi
+import pytest
+
+gi.require_version("Atspi", "2.0")
+from gi.repository import Atspi  # noqa: E402
+
+import harness  # noqa: E402
+
+
+# Distinct words on distinct rows so a caret offset can be turned back into a
+# row without ambiguity. `cat` holds the pty open; in caret mode keystrokes
+# never reach it, which is itself worth having a test for.
+SEED = f"""#!/bin/sh
+printf 'alpha bravo charlie\\n'
+printf 'delta echo foxtrot\\n'
+printf 'golf hotel india\\n'
+printf '%s\\n' '{harness.READY_MARKER}'
+exec cat
+"""
+
+
+@pytest.fixture(scope="module")
+def session(launch):
+    return launch(SEED)
+
+
+@pytest.fixture(autouse=True)
+def caret_mode(session):
+    """Enter caret mode before each test, and leave it afterwards.
+
+    Entering is idempotent (`enter_caret_mode` is a no-op when already
+    active), so this is safe even if a test left the mode on. Escape exits
+    via the built-in caret table rather than reaching the pty.
+    """
+    session.send_key("F7")
+    time.sleep(0.3)
+    yield session
+    session.send_key("Escape")
+    time.sleep(0.3)
+
+
+def caret(session) -> int:
+    return Atspi.Text.get_caret_offset(session.terminal)
+
+
+def line_at(session, offset: int) -> str:
+    """The viewport line containing `offset`, for readable assertions."""
+    text = session.text()
+    start = text.rfind("\n", 0, offset) + 1
+    end = text.find("\n", offset)
+    return text[start : end if end != -1 else len(text)]
+
+
+def test_entering_caret_mode_puts_the_caret_at_the_terminal_cursor(session):
+    """Precondition: caret mode starts where the user already is."""
+    assert 0 <= caret(session) <= len(session.text())
+
+
+def test_moving_the_caret_moves_the_at_spi_caret(session):
+    """The load-bearing test: navigation without selection must be audible.
+
+    No selection exists, so `object:text-selection-changed` cannot carry
+    this. A caret-moved event and a changed caret offset are the only things
+    a screen reader has to go on.
+    """
+    before = caret(session)
+
+    with harness.Events("object:text-caret-moved") as events:
+        session.send_key("Up")
+        session.send_key("Up")
+        events.pump(2.0)
+
+    after = caret(session)
+    print(f"\n  caret {before} -> {after}, {len(events.records)} caret-moved events")
+    print(f"  landed on: {line_at(session, after)!r}")
+
+    assert after != before, (
+        "moving the caret did not move the AT-SPI caret — a screen reader "
+        "user gets no feedback at all while navigating, because there is no "
+        "selection to report either"
+    )
+    assert events.records, (
+        "the caret moved but no object:text-caret-moved was emitted, so Orca "
+        "never learns about it"
+    )
+
+
+def test_caret_moves_between_rows(session):
+    """Up/down should land on different lines, not just different offsets."""
+    session.send_key("Up")
+    time.sleep(0.3)
+    first = line_at(session, caret(session))
+
+    session.send_key("Up")
+    time.sleep(0.3)
+    second = line_at(session, caret(session))
+
+    assert first != second, (
+        f"two Up presses stayed on the same line ({first!r}); the caret is "
+        f"not moving by rows"
+    )
+
+
+def test_selection_from_the_caret_follows_it(session):
+    """`v` anchors at the caret, and further movement extends the selection.
+
+    This is the payoff for the whole feature: the anchor is somewhere the
+    user navigated to, not wherever the shell happened to leave the cursor.
+    """
+    session.send_key("Up")
+    session.send_key("Up")
+    time.sleep(0.3)
+
+    with harness.Events("object:text-selection-changed") as events:
+        session.send_key("v")
+        time.sleep(0.3)
+        session.send_key("Right")
+        session.send_key("Right")
+        events.pump(2.0)
+
+    assert Atspi.Text.get_n_selections(session.terminal) == 1, (
+        "'v' in caret mode produced no selection"
+    )
+    r = Atspi.Text.get_selection(session.terminal, 0)
+    selected = Atspi.Text.get_text(session.terminal, r.start_offset, r.end_offset)
+    print(f"\n  selection {r.start_offset}-{r.end_offset} = {selected!r}")
+    print(f"  selection-changed events: {len(events.records)}")
+
+    assert len(selected) > 1, (
+        f"selection did not grow past the anchor cell (got {selected!r})"
+    )
+    assert events.records, "selection changes in caret mode were not announced"
+
+
+def test_caret_mode_swallows_keys_instead_of_typing_them(session):
+    """Navigation keys must not reach the shell.
+
+    `j`/`k` are movement in caret mode. If they leaked to the pty, `cat`
+    would echo them into the viewport, corrupting the very text the user is
+    trying to read.
+    """
+    before = session.text()
+    session.send_key("j")
+    session.send_key("k")
+    time.sleep(0.5)
+
+    assert session.text() == before, (
+        "caret-mode keys reached the pty and changed the viewport; they must "
+        "be swallowed"
+    )
+
+
+def test_shift_arrow_selects_without_needing_v(session):
+    """The universal selection idiom must work here too.
+
+    Before `move_caret_select` existed the caret table's `catch_all=ignore`
+    swallowed shift+arrow outright: no caret movement, no selection, nothing.
+    That left `v` as the only way in, which assumes vim conventions, and it
+    also discarded the keystroke shape Orca classifies best — it treats
+    shift+arrow as caret selection and announces the selected text.
+    """
+    session.send_key("Up")
+    time.sleep(0.3)
+    assert Atspi.Text.get_n_selections(session.terminal) == 0, (
+        "a selection already existed, so this proves nothing"
+    )
+
+    with harness.Events("object:text-selection-changed") as events:
+        session.send_key("shift+Right")
+        session.send_key("shift+Right")
+        events.pump(2.0)
+
+    assert Atspi.Text.get_n_selections(session.terminal) == 1, (
+        "shift+Right in caret mode produced no selection — it was most "
+        "likely swallowed by the caret table's catch_all"
+    )
+    r = Atspi.Text.get_selection(session.terminal, 0)
+    selected = Atspi.Text.get_text(session.terminal, r.start_offset, r.end_offset)
+    print(f"\n  shift+Right x2 selected {selected!r}, {len(events.records)} events")
+
+    assert len(selected) > 1, (
+        f"selection did not grow with repeated presses (got {selected!r}); "
+        f"the anchor is being reset on every keypress"
+    )
+    assert events.records, "shift+arrow selection was not announced"
