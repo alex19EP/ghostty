@@ -6802,6 +6802,22 @@ pub const Keybinds = struct {
             try t.put(alloc, .{ .key = .{ .physical = .page_up }, .mods = .{ .shift = true } }, .{ .move_caret_select = .page_up });
             try t.put(alloc, .{ .key = .{ .physical = .page_down }, .mods = .{ .shift = true } }, .{ .move_caret_select = .page_down });
 
+            // Home and End. Without these the physical keys fall to the
+            // `catch_all` below and do nothing at all, which is worse than
+            // either behaviour — and shift+home/end above already work, so
+            // the unmodified keys silently doing nothing is baffling.
+            //
+            // These follow the text-widget meaning (start/end of line) and
+            // not the `move_caret:home`/`end` arguments, which mean top and
+            // bottom of the screen. Those get the ctrl variants, again as in
+            // a text widget.
+            try t.put(alloc, .{ .key = .{ .physical = .home } }, .{ .move_caret = .beginning_of_line });
+            try t.put(alloc, .{ .key = .{ .physical = .end } }, .{ .move_caret = .end_of_line });
+            try t.put(alloc, .{ .key = .{ .physical = .home }, .mods = .{ .ctrl = true } }, .{ .move_caret = .home });
+            try t.put(alloc, .{ .key = .{ .physical = .end }, .mods = .{ .ctrl = true } }, .{ .move_caret = .end });
+            try t.put(alloc, .{ .key = .{ .physical = .home }, .mods = .{ .ctrl = true, .shift = true } }, .{ .move_caret_select = .home });
+            try t.put(alloc, .{ .key = .{ .physical = .end }, .mods = .{ .ctrl = true, .shift = true } }, .{ .move_caret_select = .end });
+
             // Activate whatever the caret is on. Without this, links are
             // announced but unreachable from the keyboard.
             try t.put(alloc, .{ .key = .{ .physical = .enter } }, .open_link);

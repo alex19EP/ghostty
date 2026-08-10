@@ -2956,39 +2956,89 @@ pub fn exitCaretMode(self: *Screen) void {
 
 /// Move the caret by the given adjustment. If a selection is active its
 /// end point is updated to follow the caret. No-op if caret mode is inactive.
+/// The last column of this row that holds text, or 0 for a blank row.
+fn rowTextEnd(pin: Pin) size.CellCountInt {
+    const rac = pin.rowAndCell();
+    const cells = pin.node.page().getCells(rac.row);
+    var last: size.CellCountInt = 0;
+    for (cells, 0..) |*cell, i| {
+        if (cell.hasText()) last = @intCast(i);
+    }
+    return last;
+}
+
+/// Pull the caret back onto text if it has landed in a row's trailing
+/// blanks.
+///
+/// Terminal rows are always full width, but the accessibility view trims
+/// trailing blanks, so every column past the last character maps to the
+/// same text offset. A caret out there moves without moving as far as an
+/// assistive client is concerned: it reports an identical position no
+/// matter how many times an arrow key is pressed, which reads as the caret
+/// having vanished or stuck. Clamping is also what a text widget does —
+/// End is the end of the content, not the far edge of the window.
+fn clampCaretToText(pin: *Pin) void {
+    const end = rowTextEnd(pin.*);
+    if (pin.x > end) pin.x = end;
+}
+
 pub fn moveCaret(self: *Screen, adjustment: Selection.Adjustment) void {
     const pin = self.caret_pin orelse return;
     switch (adjustment) {
         .up => if (pin.up(1)) |new_pin| {
             pin.* = new_pin;
+            clampCaretToText(pin);
         },
 
         .down => if (pin.down(1)) |new_pin| {
             pin.* = new_pin;
+            clampCaretToText(pin);
         },
 
         .left => {
             var it = pin.cellIterator(.left_up, null);
             _ = it.next();
-            if (it.next()) |next| pin.* = next;
+            if (it.next()) |next| {
+                pin.* = next;
+                // Stepping back over a row boundary lands on the previous
+                // row's last *column*, which is usually blank.
+                clampCaretToText(pin);
+            }
         },
 
         .right => {
-            var it = pin.cellIterator(.right_down, null);
-            _ = it.next();
-            if (it.next()) |next| pin.* = next;
+            // Walking into the trailing blanks would strand the caret at a
+            // position the accessibility view cannot distinguish, so at the
+            // end of a row we move to the start of the next one instead —
+            // the same thing a text widget does.
+            if (pin.x >= rowTextEnd(pin.*)) {
+                if (pin.down(1)) |next| {
+                    pin.* = next;
+                    pin.x = 0;
+                }
+            } else {
+                var it = pin.cellIterator(.right_down, null);
+                _ = it.next();
+                if (it.next()) |next| pin.* = next;
+            }
         },
 
-        .page_up => if (pin.up(self.pages.rows)) |new_pin| {
-            pin.* = new_pin;
-        } else {
-            while (pin.up(1)) |new_pin| pin.* = new_pin;
+        .page_up => {
+            if (pin.up(self.pages.rows)) |new_pin| {
+                pin.* = new_pin;
+            } else {
+                while (pin.up(1)) |new_pin| pin.* = new_pin;
+            }
+            clampCaretToText(pin);
         },
 
-        .page_down => if (pin.down(self.pages.rows)) |new_pin| {
-            pin.* = new_pin;
-        } else {
-            while (pin.down(1)) |new_pin| pin.* = new_pin;
+        .page_down => {
+            if (pin.down(self.pages.rows)) |new_pin| {
+                pin.* = new_pin;
+            } else {
+                while (pin.down(1)) |new_pin| pin.* = new_pin;
+            }
+            clampCaretToText(pin);
         },
 
         .home => pin.* = self.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
@@ -3000,7 +3050,7 @@ pub fn moveCaret(self: *Screen, adjustment: Selection.Adjustment) void {
                 const cells = next.node.page().getCells(rac.row);
                 if (Cell.hasTextAny(cells)) {
                     pin.* = next;
-                    pin.x = @intCast(cells.len - 1);
+                    pin.x = rowTextEnd(next);
                     break;
                 }
             }
@@ -3008,7 +3058,8 @@ pub fn moveCaret(self: *Screen, adjustment: Selection.Adjustment) void {
 
         .beginning_of_line => pin.x = 0,
 
-        .end_of_line => pin.x = pin.node.cols() - 1,
+        // End of the text, not the last column. See `clampCaretToText`.
+        .end_of_line => pin.x = rowTextEnd(pin.*),
     }
 
     self.dirty.caret = true;
