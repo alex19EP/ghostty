@@ -115,6 +115,12 @@ keybind = f10=scroll_page_lines:1
 """
 
 
+# X11 window ids already handed to a Session. Sessions are indistinguishable
+# by class name, so this is what stops a second one from claiming the first
+# one's window. See `Session.focus`.
+_CLAIMED_WINDOWS: set[str] = set()
+
+
 class Timeout(Exception):
     """A wait helper gave up. Always raised with what it was waiting for."""
 
@@ -224,6 +230,9 @@ class Session:
         return self
 
     def stop(self) -> None:
+        if self._window_id is not None:
+            _CLAIMED_WINDOWS.discard(self._window_id)
+            self._window_id = None
         if self.proc is not None and self.proc.poll() is None:
             # The whole app lives in its own process group (start_new_session),
             # so this also reaps the shell and `cat` behind the pty.
@@ -319,16 +328,29 @@ class Session:
         Required, not cosmetic: `axNotifyIfChanged` is gated on the surface
         being focused, so an unfocused window emits no change events at all.
         There is no window manager under Xvfb, hence the explicit XSetInputFocus.
+
+        Every session shares INSTANCE_NAME, so the xdotool search cannot tell
+        two of them apart. Resolve the window once and remember it: without
+        that, calling `focus()` on the first session after a second one has
+        started hands focus to the *second* window and silently tests the
+        wrong terminal.
         """
-        window = _wait(
-            "the X11 window to map",
-            lambda: subprocess.run(
-                ["xdotool", "search", "--onlyvisible", "--classname", INSTANCE_NAME],
-                capture_output=True,
-                text=True,
-            ).stdout.split(),
-        )
-        self._window_id = window[-1]
+        if self._window_id is None:
+            window = _wait(
+                "the X11 window to map",
+                lambda: [
+                    w
+                    for w in subprocess.run(
+                        ["xdotool", "search", "--onlyvisible", "--classname",
+                         INSTANCE_NAME],
+                        capture_output=True,
+                        text=True,
+                    ).stdout.split()
+                    if w not in _CLAIMED_WINDOWS
+                ],
+            )
+            self._window_id = window[-1]
+            _CLAIMED_WINDOWS.add(self._window_id)
         subprocess.run(["xdotool", "windowraise", self._window_id], check=False)
         subprocess.run(["xdotool", "windowfocus", self._window_id], check=True)
 
