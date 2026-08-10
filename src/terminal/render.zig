@@ -134,6 +134,10 @@ pub const RenderState = struct {
     /// Cursor state within the viewport.
     cursor: Cursor,
 
+    /// Caret position within the viewport. Null when caret mode is inactive
+    /// or the caret is scrolled out of view.
+    caret: ?Cursor.Viewport = null,
+
     /// The captured rows, from top to bottom.
     ///
     /// Without overscan this has exactly `rows` entries and the index is
@@ -612,6 +616,7 @@ pub const RenderState = struct {
         // probably cache this by comparing the cursor pin and viewport pin
         // but may not be worth it.
         self.cursor.viewport = null;
+        self.caret = null;
 
         // Colors.
         self.colors.cursor = t.colors.cursor.get();
@@ -758,6 +763,33 @@ pub const RenderState = struct {
                     // up rather than calling this.
                     .wide_tail = if (s.cursor.x > 0)
                         s.cursorCellLeft(1).wide == .wide
+                    else
+                        false,
+                };
+            }
+
+            // Find the caret the same way, if caret mode is active. This is
+            // deliberately a separate block from the cursor above: the caret
+            // roams under keyboard control while the terminal cursor stays
+            // wherever the shell left it, so the two are rarely on the same
+            // row and neither lookup can stand in for the other.
+            if (s.caret_mode and self.caret == null) caret: {
+                const cp = s.caret_pin orelse break :caret;
+                if (node != cp.node) break :caret;
+                if (cp.y < chunk.start or cp.y >= chunk.start + take) break :caret;
+
+                // Like the cursor, the caret may be in an overscan row, in
+                // which case it is not visible in the viewport. `y` is a
+                // `row_data` index, not a viewport y, once overscan is
+                // requested.
+                const idx = y + (cp.y - chunk.start);
+                const vp_start = self.viewportStart();
+                if (idx < vp_start or idx >= vp_start + self.rows) break :caret;
+                self.caret = .{
+                    .y = @intCast(idx - vp_start),
+                    .x = cp.x,
+                    .wide_tail = if (cp.x > 0)
+                        cp.rowAndCell().cell.wide == .spacer_tail
                     else
                         false,
                 };
@@ -2987,6 +3019,43 @@ test "overscan cursor in overscan row" {
     try state.update(alloc, &t);
     try testing.expectEqual(state.rows - 1, state.cursor.viewport.?.y);
     try testing.expectEqual(0, state.cursor.viewport.?.x);
+}
+
+test "overscan caret is reported in viewport coordinates" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 10,
+        .max_scrollback_bytes = 1_000_000,
+    });
+    defer t.deinit(alloc);
+
+    // The caret starts at the cursor, which is on the last active row.
+    try testWriteNumberedLines(&t, 50);
+    try t.screens.active.enterCaretMode();
+
+    // Overscan above shifts every viewport row within `row_data`, so a
+    // caret reported as a raw `row_data` index lands `viewportStart()`
+    // rows too low. The cursor is computed independently and must agree.
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    state.overscan_request = .{ .above = 3, .below = 2 };
+
+    try state.update(alloc, &t);
+    try testing.expectEqual(3, state.viewportStart());
+    try testing.expectEqual(state.rows - 1, state.caret.?.y);
+    try testing.expectEqual(state.cursor.viewport.?.y, state.caret.?.y);
+    try testing.expectEqual(state.cursor.viewport.?.x, state.caret.?.x);
+
+    // Scrolled up one row, the caret's row is captured as overscan below
+    // the viewport. It is not visible, so it is not reported.
+    t.scrollViewport(.{ .delta = -1 });
+    try state.update(alloc, &t);
+    try testing.expectEqual(1, state.overscan.below);
+    try testing.expect(state.caret == null);
 }
 
 test "overscan selection on overscan rows" {
