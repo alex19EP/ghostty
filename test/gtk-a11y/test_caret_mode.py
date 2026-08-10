@@ -294,3 +294,72 @@ def test_right_at_end_of_line_moves_to_the_next_row(session):
         f"Right at the end of {before!r} stayed on the same line; it should "
         f"continue onto the next row"
     )
+
+
+def selected(session):
+    """The selected text, or None when there is no selection."""
+    if Atspi.Text.get_n_selections(session.terminal) < 1:
+        return None
+    r = Atspi.Text.get_selection(session.terminal, 0)
+    return Atspi.Text.get_text(session.terminal, r.start_offset, r.end_offset)
+
+
+def test_releasing_shift_stops_selecting(session):
+    """A shift-started selection must not keep growing once shift is let go.
+
+    This is the text-widget contract, and the one Windows Terminal's mark
+    mode follows: shift+arrow expands, plain arrow moves and collapses.
+    Extending unconditionally -- which is what caret mode did before -- has
+    no precedent anywhere, and left a user selecting text they thought they
+    had stopped selecting.
+    """
+    session.send_key("ctrl+Home")
+    time.sleep(0.3)
+
+    for _ in range(3):
+        session.send_key("shift+Right")
+        time.sleep(0.15)
+    grown = selected(session)
+    assert grown is not None and len(grown) > 1, (
+        f"shift+Right did not build a selection (got {grown!r})"
+    )
+
+    session.send_key("Right")
+    time.sleep(0.3)
+
+    assert selected(session) is None, (
+        f"a plain Right left the selection {selected(session)!r} in place; "
+        f"releasing shift must stop the selection growing"
+    )
+
+
+def test_v_selection_keeps_following_plain_movement(session):
+    """The other idiom, which must survive the fix above.
+
+    `v` is vim's visual mode: it is sticky on purpose, and plain movement
+    keeps extending until the selection is ended. If the collapse rule were
+    applied unconditionally, `v` would do nothing useful at all.
+    """
+    session.send_key("ctrl+Home")
+    time.sleep(0.3)
+
+    session.send_key("v")
+    time.sleep(0.3)
+    anchored = selected(session)
+    assert anchored is not None, "'v' did not start a selection"
+
+    for _ in range(3):
+        session.send_key("Right")
+        time.sleep(0.15)
+    grown = selected(session)
+
+    assert grown is not None, "plain movement cleared a 'v' selection"
+    assert len(grown) > len(anchored), (
+        f"'v' selection did not grow with plain movement: "
+        f"{anchored!r} -> {grown!r}"
+    )
+
+    # And `v` again ends it, leaving plain movement inert once more.
+    session.send_key("v")
+    time.sleep(0.3)
+    assert selected(session) is None, "second 'v' did not clear the selection"

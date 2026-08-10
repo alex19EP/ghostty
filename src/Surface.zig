@@ -4416,6 +4416,49 @@ fn processLinks(self: *Surface, pos: apprt.CursorPos) !bool {
     return self.openLink(link);
 }
 
+/// Move the caret and keep it on screen.
+///
+/// Shared by `move_caret` and `move_caret_select`; the difference between
+/// those two is entirely in what they do to the selection *before* calling
+/// this, so the movement itself lives in one place.
+///
+/// Requires the renderer state mutex is held.
+fn caretMove(
+    self: *Surface,
+    screen: *terminal.Screen,
+    direction: input.Binding.Action.MoveCaret,
+) !void {
+    screen.moveCaret(switch (direction) {
+        .left => .left,
+        .right => .right,
+        .up => .up,
+        .down => .down,
+        .page_up => .page_up,
+        .page_down => .page_down,
+        .home => .home,
+        .end => .end,
+        .beginning_of_line => .beginning_of_line,
+        .end_of_line => .end_of_line,
+    });
+
+    // Scroll the viewport to keep the caret in view.
+    if (screen.caret_pin) |cp| caret_scroll: {
+        const viewport_tl = screen.pages.getTopLeft(.viewport);
+        const viewport_br = screen.pages.getBottomRight(.viewport).?;
+        if (cp.*.isBetween(viewport_tl, viewport_br)) break :caret_scroll;
+
+        const target = if (cp.*.before(viewport_tl))
+            cp.*
+        else
+            cp.*.up(screen.pages.rows - 1) orelse cp.*;
+
+        screen.scroll(.{ .pin = target });
+    }
+
+    screen.dirty.caret = true;
+    try self.queueRender();
+}
+
 /// Find a link at `pin` for keyboard activation.
 ///
 /// Deliberately different from `linkAtPos` in two ways, both because a
@@ -5823,27 +5866,30 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
         },
 
         .move_caret_select => |direction| {
+            self.renderer_state.mutex.lockUncancelable(global.io());
+            defer self.renderer_state.mutex.unlock(global.io());
+
+            const screen: *terminal.Screen = self.io.terminal.screens.active;
+            if (!screen.caret_mode) return false;
+
             // Anchor first if nothing is selected yet. `moveCaret` extends
             // whatever selection is active, so with an anchor in place the
             // move below both starts and grows it in a single press.
-            //
-            // The lock is scoped rather than held across the delegation
-            // below: `move_caret` takes the renderer mutex itself and it is
-            // not reentrant.
-            {
-                self.renderer_state.mutex.lockUncancelable(global.io());
-                defer self.renderer_state.mutex.unlock(global.io());
+            if (screen.selection == null) {
+                const pin = (screen.caret_pin orelse screen.cursor.page_pin).*;
+                try self.setSelection(terminal.Selection.init(pin, pin, false));
 
-                const screen: *terminal.Screen = self.io.terminal.screens.active;
-                if (!screen.caret_mode) return false;
-
-                if (screen.selection == null) {
-                    const pin = (screen.caret_pin orelse screen.cursor.page_pin).*;
-                    try self.setSelection(terminal.Selection.init(pin, pin, false));
-                }
+                // Started with shift held, so it is not sticky: letting go of
+                // shift and moving must collapse it, as it does in any text
+                // widget. A selection that already existed keeps whatever
+                // mode it was started in.
+                screen.caret_selection_sticky = false;
             }
 
-            return self.performBindingAction(.{ .move_caret = direction });
+            // Deliberately not delegating to `.move_caret`: that action
+            // collapses a non-sticky selection, which would throw away the
+            // anchor this one just placed.
+            try self.caretMove(screen, direction);
         },
 
         .move_caret => |direction| {
@@ -5853,35 +5899,16 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             const screen: *terminal.Screen = self.io.terminal.screens.active;
             if (!screen.caret_mode) return false;
 
-            screen.moveCaret(switch (direction) {
-                .left => .left,
-                .right => .right,
-                .up => .up,
-                .down => .down,
-                .page_up => .page_up,
-                .page_down => .page_down,
-                .home => .home,
-                .end => .end,
-                .beginning_of_line => .beginning_of_line,
-                .end_of_line => .end_of_line,
-            });
-
-            // Scroll viewport to keep caret in view.
-            if (screen.caret_pin) |cp| caret_scroll: {
-                const viewport_tl = screen.pages.getTopLeft(.viewport);
-                const viewport_br = screen.pages.getBottomRight(.viewport).?;
-                if (cp.*.isBetween(viewport_tl, viewport_br)) break :caret_scroll;
-
-                const target = if (cp.*.before(viewport_tl))
-                    cp.*
-                else
-                    cp.*.up(screen.pages.rows - 1) orelse cp.*;
-
-                screen.scroll(.{ .pin = target });
+            // Unmodified movement collapses a selection that shift started.
+            // `moveCaret` extends whatever selection is still active, so
+            // clearing here is what makes releasing shift stop selecting.
+            // A sticky selection (from `toggle_caret_selection`) survives and
+            // keeps following the caret, which is vim's visual mode.
+            if (screen.selection != null and !screen.caret_selection_sticky) {
+                try self.setSelection(null);
             }
 
-            screen.dirty.caret = true;
-            try self.queueRender();
+            try self.caretMove(screen, direction);
         },
 
         .toggle_caret_selection => {
@@ -5893,11 +5920,14 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
 
             if (screen.selection != null) {
                 // Clear the existing selection.
-                screen.clearSelection();
+                try self.setSelection(null);
+                screen.caret_selection_sticky = false;
             } else if (screen.caret_pin) |cp| {
-                // Anchor a new selection at the caret position.
-                const sel = terminal.Selection.init(cp.*, cp.*, false);
-                try screen.select(sel);
+                // Anchor a new selection at the caret position. This is the
+                // vim-visual-mode entry point, so the selection is sticky:
+                // plain movement keeps extending it until it is ended.
+                try self.setSelection(terminal.Selection.init(cp.*, cp.*, false));
+                screen.caret_selection_sticky = true;
             }
 
             try self.queueRender();
