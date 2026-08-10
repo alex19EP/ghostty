@@ -6740,6 +6740,18 @@ pub const Keybinds = struct {
             .{ .adjust_selection = .end },
             .{ .performable = true },
         );
+        try self.set.putFlags(
+            alloc,
+            .{ .key = .{ .physical = .arrow_left }, .mods = .{ .shift = true, .alt = true } },
+            .{ .adjust_selection = .word_left },
+            .{ .performable = true },
+        );
+        try self.set.putFlags(
+            alloc,
+            .{ .key = .{ .physical = .arrow_right }, .mods = .{ .shift = true, .alt = true } },
+            .{ .adjust_selection = .word_right },
+            .{ .performable = true },
+        );
 
         // Built-in "caret" key table for keyboard-driven scrollback navigation.
         // Users activate it by binding `enter_caret_mode` to a key.

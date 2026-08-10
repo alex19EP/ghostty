@@ -334,6 +334,20 @@ typedef enum GHOSTTY_ENUM_TYPED {
   /** Move to the right edge of the current line. */
   GHOSTTY_SELECTION_ADJUST_END_OF_LINE = 9,
 
+  /**
+   * Move left to the start of the previous word, using the default word
+   * boundary codepoints. Stops at a hard line break; a soft-wrapped line
+   * is crossed.
+   */
+  GHOSTTY_SELECTION_ADJUST_WORD_LEFT = 10,
+
+  /**
+   * Move right to the end of the next word, using the default word
+   * boundary codepoints. Stops at a hard line break; a soft-wrapped line
+   * is crossed.
+   */
+  GHOSTTY_SELECTION_ADJUST_WORD_RIGHT = 11,
+
   GHOSTTY_SELECTION_ADJUST_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttySelectionAdjust;
 
