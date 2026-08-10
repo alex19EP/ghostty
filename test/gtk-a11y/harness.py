@@ -71,6 +71,26 @@ printf '\\033[?1000h\\033[?1006h'
 exec cat
 """
 
+# Seed for test_scroll.py. Prints more rows than the window is tall so there is
+# real scrollback above the viewport, with every row distinct — identical rows
+# would let a shift match at more than one offset and make the assertions
+# ambiguous about which one the diff picked.
+#
+# The ready marker goes *last* here, unlike every other seed. Only the visible
+# screen is exposed over AT-SPI, so a marker printed first would have scrolled
+# out of the viewport by the time anything could look for it and `start()`
+# would wait for it forever.
+SCROLL_ROWS = 60
+SCROLL_SEED_SCRIPT = f"""#!/bin/sh
+i=0
+while [ $i -lt {SCROLL_ROWS} ]; do
+    printf 'row %03d filler\\n' "$i"
+    i=$((i + 1))
+done
+printf '%s\\n' '{READY_MARKER}'
+exec cat
+"""
+
 CONFIG = f"""
 x11-instance-name = {INSTANCE_NAME}
 gtk-single-instance = false
@@ -85,6 +105,13 @@ confirm-close-surface = false
 resize-overlay = never
 cursor-style-blink = false
 link-url = true
+
+# One-line scroll, for test_scroll.py. Ghostty binds no single key to this by
+# default and the default page-sized bindings replace the whole viewport, which
+# is precisely the case a shift diff cannot help with — a partial scroll is what
+# exercises it. F9/F10 are unbound both here and in the pty behind the tests.
+keybind = f9=scroll_page_lines:-1
+keybind = f10=scroll_page_lines:1
 """
 
 

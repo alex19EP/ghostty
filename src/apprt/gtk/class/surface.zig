@@ -3551,43 +3551,34 @@ pub const Surface = extern struct {
     /// rest was replaced. `p` and `old.len - s` are guaranteed to land on
     /// UTF-8 codepoint boundaries in `old`.
     const PrefixSuffixDiff = a11y_offsets.PrefixSuffixDiff;
-    const axComputePrefixSuffix = a11y_offsets.prefixSuffix;
-    const axComputeScrollK = a11y_offsets.scrollK;
 
-    /// Pick between a prefix/suffix diff and a line-shift scroll diff based
-    /// on which emits fewer bytes, and fire the corresponding AT-SPI events.
+    /// Describe the change from `old_text` to `new_text` in the cheapest
+    /// shape available and fire the corresponding AT-SPI events.
     ///
-    /// The comparison matters: on a real whole-line scroll, prefix/suffix
-    /// covers nearly the whole viewport (the middle shifted position) and
-    /// scroll wins. But scroll detection can also match spuriously on a
-    /// typing-echo change — e.g. typing `x` at a `$ ` prompt when earlier
-    /// rows also end in `$ ` — because the last row of old happens to be
-    /// a prefix of new. Picking the cheaper diff avoids that trap.
+    /// `a11y_offsets.chooseDiff` owns the choice — it is pure arithmetic
+    /// over the two snapshots, and keeping it there is what lets the
+    /// selection be unit-tested without a live terminal. This function is
+    /// only the emit half.
     ///
-    /// Modelling scrolls as `.remove` at the top + `.insert` at the tail
-    /// also matches what VTE/gnome-terminal expose to AT-SPI, which is
-    /// what Orca's terminal script is written against.
+    /// Modelling a shift as a `.remove` at one end and an `.insert` at the
+    /// other, rather than as one viewport-sized replacement, matches what
+    /// VTE/gnome-terminal expose to AT-SPI — which is what Orca's terminal
+    /// script is written against, and the difference between Orca reading
+    /// out the line that just scrolled into view and Orca reading out the
+    /// entire screen.
     fn axEmitTextDiff(self: *Self, old_text: []const u8, new_text: []const u8) void {
-        const ps = axComputePrefixSuffix(old_text, new_text);
-        const ps_total = (old_text.len - ps.p - ps.s) + (new_text.len - ps.p - ps.s);
-
-        const scroll_k = axComputeScrollK(old_text, new_text);
-        const scroll_total = if (scroll_k > 0)
-            scroll_k + (new_text.len - (old_text.len - scroll_k))
-        else
-            std.math.maxInt(usize);
-
-        if (scroll_k > 0 and scroll_total < ps_total) {
-            self.axEmitScroll(old_text, new_text, scroll_k);
-        } else if (ps_total > 0) {
-            self.axEmitPrefixSuffix(old_text, new_text, ps);
+        switch (a11y_offsets.chooseDiff(old_text, new_text)) {
+            .none => {},
+            .shift_up => |k| self.axEmitShiftUp(old_text, new_text, k),
+            .shift_down => |j| self.axEmitShiftDown(old_text, new_text, j),
+            .replace => |ps| self.axEmitPrefixSuffix(old_text, new_text, ps),
         }
     }
 
-    /// Emit a `.remove(0, K_cp)` + `.insert(tail_cp, |new|_cp)` pair for a
-    /// line-shift scroll. `scroll_k` must be > 0 and landing on a `\n`
-    /// boundary of `old` (guaranteed by `axComputeScrollK`).
-    fn axEmitScroll(
+    /// Emit a `.remove(0, K_cp)` + `.insert(tail_cp, |new|_cp)` pair for an
+    /// upward line shift. `scroll_k` must be > 0 and landing on a `\n`
+    /// boundary of `old` (guaranteed by `a11y_offsets.chooseDiff`).
+    fn axEmitShiftUp(
         self: *Self,
         old_text: []const u8,
         new_text: []const u8,
@@ -3611,6 +3602,50 @@ pub const Surface = extern struct {
         if (new_end_cp > tail_cp) {
             gtk.AccessibleText.updateContents(ax_self, .insert, tail_cp, new_end_cp);
         }
+    }
+
+    /// Emit a `.remove(kept_cp, |old|_cp)` + `.insert(0, J_cp)` pair for a
+    /// downward line shift: `new[0..scroll_j]` scrolled in at the top and
+    /// the tail of `old` fell off the bottom. `scroll_j` must be > 0 and
+    /// landing on a `\n` boundary of `new` (guaranteed by
+    /// `a11y_offsets.chooseDiff`).
+    ///
+    /// This is what a user scrolling back through output produces —
+    /// `shift+page_up`, `ctrl+shift+up` to the previous prompt, a wheel
+    /// tick. Without it the change falls through to the prefix/suffix
+    /// path, where a one-line shift has neither a common prefix (row 0
+    /// changed) nor a common suffix (the last row is gone) and so gets
+    /// announced as a replacement of the whole viewport.
+    ///
+    /// Remove first, then insert: after the remove the exposed text is
+    /// `old[0..kept]`, which is exactly `new[scroll_j..]`, so the insert
+    /// offset needs no adjustment for the deletion.
+    fn axEmitShiftDown(
+        self: *Self,
+        old_text: []const u8,
+        new_text: []const u8,
+        scroll_j: usize,
+    ) void {
+        const ax_self: *gtk.AccessibleText = @ptrCast(self);
+
+        // Bytes of `old` that survive the shift. `chooseDiff` guarantees
+        // `old_text[0..kept] == new_text[scroll_j..]`, which bounds this
+        // by `old_text.len`.
+        const kept = new_text.len - scroll_j;
+        const kept_cp: c_uint = @intCast(utf8CpCount(old_text[0..kept]));
+        const old_end_cp: c_uint = @intCast(utf8CpCount(old_text));
+        const inserted_cp: c_uint = @intCast(utf8CpCount(new_text[0..scroll_j]));
+
+        // As in `axEmitShiftUp`, the bridge reads the deleted range back
+        // out of us synchronously, so the cache has to point at the
+        // pre-remove text for the duration of the call.
+        if (old_end_cp > kept_cp) {
+            const saved = self.axAliasOldSnapshot();
+            defer self.axRestoreCache(saved);
+            gtk.AccessibleText.updateContents(ax_self, .remove, kept_cp, old_end_cp);
+        }
+
+        gtk.AccessibleText.updateContents(ax_self, .insert, 0, inserted_cp);
     }
 
     /// Emit a single remove+insert pair covering the region between the
