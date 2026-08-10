@@ -5316,16 +5316,35 @@ pub const Surface = extern struct {
         // AT-SPI change events when something actually changed, so we don't
         // interrupt Orca (or any other AT client) mid-read on every GL frame.
         //
-        // Gated on focus as well as `ax_active`. GTK gives us no signal for
-        // "the last AT client went away", so `ax_active` latches on at the
-        // first query and never clears — without the focus check we would
-        // keep probing every frame forever, including long after Orca has
-        // exited. Change *events* are only meaningful for the surface the
-        // user is on; on-demand reads (flat review, caret queries) go
-        // through the GtkAccessibleText vfuncs and keep working on any
-        // surface, focused or not.
+        // Deliberately NOT gated on focus. It used to be, to keep
+        // `ax_active` — which latches on at the first query and never clears,
+        // because GTK exposes no "the last AT client went away" signal — from
+        // probing forever after the AT client exited. That reasoning does not
+        // survive inspection: the *focused* surface kept probing regardless,
+        // so the gate never addressed the case it was written for. What it
+        // did do was silence every surface the user was not on. With splits
+        // that is a real loss — a build running in the other half of the
+        // window produced no announcements at all — and any hiccup in focus
+        // tracking became permanent silence rather than mere noise. Whether
+        // to speak an unfocused terminal is the AT client's policy call, not
+        // ours to make by withholding the events.
+        //
+        // Not gated on `org.a11y.Status.IsEnabled` either, which looks like
+        // the signal we want and is not: it is a hint assistive technologies
+        // *write*, not a statement that one is listening. Orca sets it; a
+        // braille-only client, Accerciser and our own test harness do not.
+        // Measured false in `test/gtk-a11y` while a fully functional AT-SPI
+        // client was driving the app, so gating on it would trade working
+        // accessibility for the saving below.
+        //
+        // That saving is one probe per *rendered* frame per surface — 7.8us
+        // at 30x80, 20.7us at 60x200 (`ghostty-bench +a11y-text
+        // --mode=probe`). A surface that is not rendering pays nothing, which
+        // is exactly the idle case the old comment worried about, so the
+        // latch costs approximately nothing and is not worth a gate that can
+        // fail closed.
         priv.ax_cache_stale = true;
-        if (priv.ax_active and priv.focused) self.axNotifyIfChanged();
+        if (priv.ax_active) self.axNotifyIfChanged();
 
         return 1;
     }
