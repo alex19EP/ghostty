@@ -6775,6 +6775,21 @@ pub const Keybinds = struct {
             try t.put(alloc, .{ .key = .{ .physical = .arrow_left } }, .{ .move_caret = .left });
             try t.put(alloc, .{ .key = .{ .physical = .arrow_right } }, .{ .move_caret = .right });
 
+            // Word movement. ctrl + arrow is the text-widget shortcut, and
+            // the one screen readers read best: Orca classifies it as word
+            // navigation and announces the word landed on, where the vim
+            // letters below are classified as typing and stay silent.
+            //
+            // `b` and `e` are vim's, and mean what they do there: back to
+            // the start of a word, forward to the end of one. `w` is left
+            // unbound on purpose — it means "start of the *next* word",
+            // a third motion neither adjustment performs, and binding it to
+            // `e`'s behaviour would be a quiet lie to anyone who knows vim.
+            try t.put(alloc, .{ .key = .{ .physical = .arrow_left }, .mods = .{ .ctrl = true } }, .{ .move_caret = .word_left });
+            try t.put(alloc, .{ .key = .{ .physical = .arrow_right }, .mods = .{ .ctrl = true } }, .{ .move_caret = .word_right });
+            try t.put(alloc, .{ .key = .{ .unicode = 'b' } }, .{ .move_caret = .word_left });
+            try t.put(alloc, .{ .key = .{ .unicode = 'e' } }, .{ .move_caret = .word_right });
+
             // Page movement
             try t.put(alloc, .{ .key = .{ .physical = .page_up } }, .{ .move_caret = .page_up });
             try t.put(alloc, .{ .key = .{ .physical = .page_down } }, .{ .move_caret = .page_down });
@@ -6813,6 +6828,8 @@ pub const Keybinds = struct {
             try t.put(alloc, .{ .key = .{ .physical = .end }, .mods = .{ .shift = true } }, .{ .move_caret_select = .end_of_line });
             try t.put(alloc, .{ .key = .{ .physical = .page_up }, .mods = .{ .shift = true } }, .{ .move_caret_select = .page_up });
             try t.put(alloc, .{ .key = .{ .physical = .page_down }, .mods = .{ .shift = true } }, .{ .move_caret_select = .page_down });
+            try t.put(alloc, .{ .key = .{ .physical = .arrow_left }, .mods = .{ .ctrl = true, .shift = true } }, .{ .move_caret_select = .word_left });
+            try t.put(alloc, .{ .key = .{ .physical = .arrow_right }, .mods = .{ .ctrl = true, .shift = true } }, .{ .move_caret_select = .word_right });
 
             // Home and End. Without these the physical keys fall to the
             // `catch_all` below and do nothing at all, which is worse than

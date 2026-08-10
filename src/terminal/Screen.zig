@@ -2973,8 +2973,6 @@ pub fn exitCaretMode(self: *Screen) void {
     self.clearSelection();
 }
 
-/// Move the caret by the given adjustment. If a selection is active its
-/// end point is updated to follow the caret. No-op if caret mode is inactive.
 /// The last column of this row that holds text, or 0 for a blank row.
 fn rowTextEnd(pin: Pin) size.CellCountInt {
     const rac = pin.rowAndCell();
@@ -3001,6 +2999,14 @@ fn clampCaretToText(pin: *Pin) void {
     if (pin.x > end) pin.x = end;
 }
 
+/// Whether two pins address the same cell.
+fn samePin(a: Pin, b: Pin) bool {
+    return a.node == b.node and a.y == b.y and a.x == b.x;
+}
+
+/// Move the caret by the given adjustment. If a selection is active its
+/// end point is updated to follow the caret. No-op if caret mode is inactive.
+///
 /// `boundary` is the word separator set, used only by the `word_left` and
 /// `word_right` adjustments, which do nothing without it.
 pub fn moveCaret(
@@ -3086,11 +3092,36 @@ pub fn moveCaret(
         // End of the text, not the last column. See `clampCaretToText`.
         .end_of_line => pin.x = rowTextEnd(pin.*),
 
-        // Same landing points as the selection adjustments: the far edge
-        // of the word, which is always a cell with text in it, so the
-        // caret never needs clamping back out of the trailing blanks.
-        .word_left => if (boundary) |b| Selection.adjustWord(pin, .left_up, b),
-        .word_right => if (boundary) |b| Selection.adjustWord(pin, .right_down, b),
+        // Same landing points as the selection adjustments -- the far edge
+        // of the word, always a cell with text in it, so the caret never
+        // needs clamping back out of the trailing blanks -- except that
+        // the caret does not stop at the end of a line.
+        //
+        // Word movement deliberately refuses to cross a hard line break,
+        // which is right for a selection but strands a caret: at the end
+        // of every line the key would simply stop working, press after
+        // press with nothing to hear. That is the dead end plain `right`
+        // used to have. So when there is no word left on this row, step
+        // onto the next one and take its first word instead.
+        .word_left => if (boundary) |b| {
+            const before = pin.*;
+            Selection.adjustWord(pin, .left_up, b);
+            if (samePin(pin.*, before)) if (pin.up(1)) |prev_row| {
+                pin.* = prev_row;
+                pin.x = rowTextEnd(pin.*);
+                Selection.adjustWord(pin, .left_up, b);
+            };
+        },
+
+        .word_right => if (boundary) |b| {
+            const before = pin.*;
+            Selection.adjustWord(pin, .right_down, b);
+            if (samePin(pin.*, before)) if (pin.down(1)) |next_row| {
+                pin.* = next_row;
+                pin.x = 0;
+                Selection.adjustWord(pin, .right_down, b);
+            };
+        },
     }
 
     self.dirty.caret = true;
@@ -12529,4 +12560,46 @@ test "Screen: selectLine does not join lines across a recycled row" {
         defer alloc.free(contents);
         try testing.expectEqualStrings("world", contents);
     }
+}
+
+test "Screen: caret word movement crosses a hard line break" {
+    // Word movement deliberately stops at a hard line break, which is right
+    // for a selection but would strand the caret at the end of every row --
+    // the same dead end plain `right` used to have. The caret steps onto the
+    // next row instead and takes its first word.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var s = try init(io, alloc, .{ .cols = 20, .rows = 5, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("alpha bravo\ncharlie delta");
+
+    const boundary = &[_]u21{ ' ', '\t' };
+
+    try s.enterCaretMode();
+    defer s.exitCaretMode();
+    const pin = s.caret_pin.?;
+
+    // Park the caret on the end of "bravo", the last word of row 0.
+    pin.* = s.pages.pin(.{ .screen = .{ .x = 10, .y = 0 } }).?;
+
+    s.moveCaret(.word_right, boundary);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 6,
+        .y = 1,
+    } }, s.pages.pointFromPin(.screen, pin.*).?);
+
+    // And back again, onto the start of the word we came from.
+    s.moveCaret(.word_left, boundary);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 1,
+    } }, s.pages.pointFromPin(.screen, pin.*).?);
+
+    s.moveCaret(.word_left, boundary);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 6,
+        .y = 0,
+    } }, s.pages.pointFromPin(.screen, pin.*).?);
 }
