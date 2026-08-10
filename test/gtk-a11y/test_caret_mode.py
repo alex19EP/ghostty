@@ -207,3 +207,90 @@ def test_shift_arrow_selects_without_needing_v(session):
         f"the anchor is being reset on every keypress"
     )
     assert events.records, "shift+arrow selection was not announced"
+
+
+# Row 0 of the seed, used by the line-boundary tests below.
+FIRST_ROW = "alpha bravo charlie"
+
+
+def test_end_lands_on_the_last_character_not_the_last_column(session):
+    """End must mean end of text, not the far edge of the window.
+
+    A terminal row is always full width, but the accessible text trims
+    trailing blanks — so a caret parked in column 79 of a 19-character row
+    reports the same offset as one at the end of the text, and End looks
+    like it did nothing.
+    """
+    session.send_key("ctrl+Home")
+    time.sleep(0.3)
+    assert caret(session) == 0, "ctrl+Home did not reach the top-left"
+
+    session.send_key("End")
+    time.sleep(0.3)
+    offset = caret(session)
+
+    assert Atspi.Text.get_text(session.terminal, offset, offset + 1) == FIRST_ROW[-1], (
+        f"End put the caret at {offset}, which is not the last character of "
+        f"{FIRST_ROW!r}"
+    )
+    assert Atspi.Text.get_text(session.terminal, offset + 1, offset + 2) == "\n", (
+        "End overshot past the end of the line"
+    )
+
+
+def test_home_returns_to_the_start_of_the_line(session):
+    session.send_key("ctrl+Home")
+    session.send_key("Down")
+    session.send_key("End")
+    time.sleep(0.4)
+    end = caret(session)
+
+    session.send_key("Home")
+    time.sleep(0.3)
+    start = caret(session)
+
+    assert start < end, f"Home moved to {start}, not before End's {end}"
+    assert Atspi.Text.get_text(session.terminal, start, start + 1) != "\n", (
+        "Home landed on the line break rather than the first character"
+    )
+
+
+def test_right_never_stalls_in_the_trailing_blanks(session):
+    """The caret must not walk into space the accessible text discards.
+
+    Every column past the last character maps to the same offset, so a
+    caret out there reports an identical position no matter how many times
+    Right is pressed. To a screen reader user the caret has vanished or
+    stuck on the last letter — which is exactly how it was reported.
+    """
+    session.send_key("ctrl+Home")
+    time.sleep(0.3)
+
+    seen = [caret(session)]
+    for _ in range(len(FIRST_ROW) + 6):
+        session.send_key("Right")
+        time.sleep(0.1)
+        seen.append(caret(session))
+
+    stalls = [(i, a) for i, (a, b) in enumerate(zip(seen, seen[1:])) if a == b]
+    print(f"\n  offsets while walking off the end of row 0: {seen}")
+    assert not stalls, (
+        f"the caret reported the same offset twice in a row at {stalls}; it "
+        f"is moving through cells the accessible text does not distinguish"
+    )
+
+
+def test_right_at_end_of_line_moves_to_the_next_row(session):
+    session.send_key("ctrl+Home")
+    session.send_key("End")
+    time.sleep(0.4)
+    before = line_at(session, caret(session))
+
+    session.send_key("Right")
+    time.sleep(0.3)
+    after = line_at(session, caret(session))
+
+    assert after != before, (
+        f"Right at the end of {before!r} stayed on the same line; it should "
+        f"continue onto the next row"
+    )
