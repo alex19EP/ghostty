@@ -407,14 +407,21 @@ pub const Adjustment = lib.Enum(lib.target, &.{
     "page_down",
     "beginning_of_line",
     "end_of_line",
+    "word_left",
+    "word_right",
 });
 
 /// Adjust the selection by some given adjustment. An adjustment allows
 /// a selection to be expanded slightly left, right, up, down, etc.
+///
+/// `boundary` is the set of codepoints that separate words, used only by
+/// the `word_left` and `word_right` adjustments. Those adjustments do
+/// nothing when it is null.
 pub fn adjust(
     self: *Selection,
     s: *const Screen,
     adjustment: Adjustment,
+    boundary: ?[]const u21,
 ) void {
     // Note that we always adjust "end" because end always represents
     // the last point of the selection by mouse, not necessarily the
@@ -425,7 +432,7 @@ pub fn adjust(
         .up => if (end_pin.up(1)) |new_end| {
             end_pin.* = new_end;
         } else {
-            self.adjust(s, .beginning_of_line);
+            self.adjust(s, .beginning_of_line, null);
         },
 
         .down => {
@@ -440,7 +447,7 @@ pub fn adjust(
                 }
             } else {
                 // If we're at the bottom, just go to the end of the line
-                self.adjust(s, .end_of_line);
+                self.adjust(s, .end_of_line, null);
             }
         },
 
@@ -473,13 +480,13 @@ pub fn adjust(
         .page_up => if (end_pin.up(s.pages.rows)) |new_end| {
             end_pin.* = new_end;
         } else {
-            self.adjust(s, .home);
+            self.adjust(s, .home, null);
         },
 
         .page_down => if (end_pin.down(s.pages.rows)) |new_end| {
             end_pin.* = new_end;
         } else {
-            self.adjust(s, .end);
+            self.adjust(s, .end, null);
         },
 
         .home => end_pin.* = s.pages.pin(.{ .screen = .{
@@ -507,7 +514,78 @@ pub fn adjust(
         .beginning_of_line => end_pin.x = 0,
 
         .end_of_line => end_pin.x = end_pin.node.cols() - 1,
+
+        .word_left => adjustWord(end_pin, .left_up, boundary orelse return),
+
+        .word_right => adjustWord(end_pin, .right_down, boundary orelse return),
     }
+}
+
+/// Move `end_pin` one word in `direction`, treating `boundary` codepoints
+/// as the separators between words. The pin does not move if there is no
+/// word to move to.
+///
+/// This walks in the two phases every text editor uses: first cross any
+/// separators lying between us and the next word, then cross that word's
+/// body, so we finish on its far edge -- its last cell going right, its
+/// first cell going left.
+pub fn adjustWord(
+    end_pin: *Pin,
+    comptime direction: PageList.Direction,
+    boundary: []const u21,
+) void {
+    var it = end_pin.cellIterator(direction, null);
+    var prev = it.next() orelse return; // the cell we're already on
+
+    var landed: ?Pin = null;
+    var phase: enum { separators, body } = .separators;
+
+    while (it.next()) |next| {
+        // Words do not run across a hard line break. A row's `wrap` flag
+        // marks it as continuing onto the row below, so a soft-wrapped
+        // line is crossed and a hard-terminated one stops us. Going right
+        // the row we are leaving decides, going left it is the row we are
+        // entering -- either way, the upper of the two. Away from a row
+        // boundary the column never matches and this is inert.
+        const upper = if (comptime direction == .right_down) prev else next;
+        if (upper.x == upper.node.cols() - 1 and
+            !upper.rowAndCell().row.wrap) break;
+        prev = next;
+
+        const rac = next.rowAndCell();
+
+        // A wide character occupies two cells and only the first carries
+        // the codepoint. Reading the spacer as a blank would stop word
+        // movement dead at the first CJK character or emoji, so skip it
+        // and judge the pair by its head -- which is what `left` and
+        // `right` already do.
+        switch (rac.cell.wide) {
+            .spacer_tail, .spacer_head => continue,
+            .narrow, .wide => {},
+        }
+
+        // Blank cells end the line as far as words are concerned.
+        if (!rac.cell.hasText()) break;
+
+        const is_boundary = std.mem.indexOfScalar(
+            u21,
+            boundary,
+            rac.cell.content.codepoint.data,
+        ) != null;
+
+        switch (phase) {
+            .separators => if (!is_boundary) {
+                landed = next;
+                phase = .body;
+            },
+
+            .body => if (is_boundary) break else {
+                landed = next;
+            },
+        }
+    }
+
+    if (landed) |pin| end_pin.* = pin;
 }
 
 test "Selection: a cursor-anchored selection grows in both directions" {
@@ -539,7 +617,7 @@ test "Selection: a cursor-anchored selection grows in both directions" {
     } }, s.pages.pointFromPin(.screen, sel.end()).?);
 
     // Extending upwards runs the selection backwards over earlier output.
-    sel.adjust(&s, .up);
+    sel.adjust(&s, .up, null);
     try testing.expectEqual(point.Point{ .screen = .{
         .x = 1,
         .y = 2,
@@ -547,8 +625,8 @@ test "Selection: a cursor-anchored selection grows in both directions" {
 
     // Coming back down travels through the anchor and out the other side,
     // so one binding covers text both above and below the cursor.
-    sel.adjust(&s, .down);
-    sel.adjust(&s, .down);
+    sel.adjust(&s, .down, null);
+    sel.adjust(&s, .down, null);
     try testing.expectEqual(point.Point{ .screen = .{
         .x = 1,
         .y = 4,
@@ -575,7 +653,7 @@ test "Selection: adjust right" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .right);
+        sel.adjust(&s, .right, null);
 
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 5,
@@ -595,7 +673,7 @@ test "Selection: adjust right" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .right);
+        sel.adjust(&s, .right, null);
 
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 4,
@@ -615,7 +693,7 @@ test "Selection: adjust right" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .right);
+        sel.adjust(&s, .right, null);
 
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 5,
@@ -642,7 +720,7 @@ test "Selection: adjust left" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .left);
+        sel.adjust(&s, .left, null);
 
         // Start line
         try testing.expectEqual(point.Point{ .screen = .{
@@ -663,7 +741,7 @@ test "Selection: adjust left" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .left);
+        sel.adjust(&s, .left, null);
 
         // Start line
         try testing.expectEqual(point.Point{ .screen = .{
@@ -691,7 +769,7 @@ test "Selection: adjust left skips blanks" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .left);
+        sel.adjust(&s, .left, null);
 
         // Start line
         try testing.expectEqual(point.Point{ .screen = .{
@@ -712,7 +790,7 @@ test "Selection: adjust left skips blanks" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .left);
+        sel.adjust(&s, .left, null);
 
         // Start line
         try testing.expectEqual(point.Point{ .screen = .{
@@ -740,7 +818,7 @@ test "Selection: adjust up" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .up);
+        sel.adjust(&s, .up, null);
 
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 5,
@@ -760,7 +838,7 @@ test "Selection: adjust up" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .up);
+        sel.adjust(&s, .up, null);
 
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 5,
@@ -787,7 +865,7 @@ test "Selection: adjust down" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .down);
+        sel.adjust(&s, .down, null);
 
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 5,
@@ -807,7 +885,7 @@ test "Selection: adjust down" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .down);
+        sel.adjust(&s, .down, null);
 
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 4,
@@ -834,7 +912,7 @@ test "Selection: adjust down with not full screen" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .down);
+        sel.adjust(&s, .down, null);
 
         // Start line
         try testing.expectEqual(point.Point{ .screen = .{
@@ -862,7 +940,7 @@ test "Selection: adjust home" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .home);
+        sel.adjust(&s, .home, null);
 
         // Start line
         try testing.expectEqual(point.Point{ .screen = .{
@@ -890,7 +968,7 @@ test "Selection: adjust end with not full screen" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .end);
+        sel.adjust(&s, .end, null);
 
         // Start line
         try testing.expectEqual(point.Point{ .screen = .{
@@ -918,7 +996,7 @@ test "Selection: adjust beginning of line" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .beginning_of_line);
+        sel.adjust(&s, .beginning_of_line, null);
 
         // Start line
         try testing.expectEqual(point.Point{ .screen = .{
@@ -939,7 +1017,7 @@ test "Selection: adjust beginning of line" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .beginning_of_line);
+        sel.adjust(&s, .beginning_of_line, null);
 
         // Start line
         try testing.expectEqual(point.Point{ .screen = .{
@@ -960,7 +1038,7 @@ test "Selection: adjust beginning of line" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .beginning_of_line);
+        sel.adjust(&s, .beginning_of_line, null);
 
         // Start line
         try testing.expectEqual(point.Point{ .screen = .{
@@ -988,7 +1066,7 @@ test "Selection: adjust end of line" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .end_of_line);
+        sel.adjust(&s, .end_of_line, null);
 
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 1,
@@ -1008,7 +1086,7 @@ test "Selection: adjust end of line" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .end_of_line);
+        sel.adjust(&s, .end_of_line, null);
 
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 1,
@@ -1028,7 +1106,7 @@ test "Selection: adjust end of line" {
             false,
         );
         defer sel.deinit(&s);
-        sel.adjust(&s, .end_of_line);
+        sel.adjust(&s, .end_of_line, null);
 
         // Start line
         try testing.expectEqual(point.Point{ .screen = .{
@@ -1037,6 +1115,252 @@ test "Selection: adjust end of line" {
         } }, s.pages.pointFromPin(.screen, sel.start()).?);
         try testing.expectEqual(point.Point{ .screen = .{
             .x = 7,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+}
+
+test "Selection: adjust word_right" {
+    const testing = std.testing;
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 10, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("hello world foo bar");
+
+    const boundary = &[_]u21{ ' ', '\t' };
+
+    // word_right from middle of "hello" -> end of "hello"
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 2, .y = 0 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_right, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 4,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+
+    // word_right from end of "hello" -> end of "world"
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 4, .y = 0 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_right, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 10,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+
+    // word_right from last word "bar" -> end of "bar"
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 16, .y = 0 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_right, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 18,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+}
+
+test "Selection: adjust word_right with multiple spaces" {
+    const testing = std.testing;
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 10, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("hello   world");
+
+    const boundary = &[_]u21{ ' ', '\t' };
+
+    // word_right from middle of "hello" -> end of "hello"
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 2, .y = 0 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_right, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 4,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+}
+
+test "Selection: adjust word_left" {
+    const testing = std.testing;
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 10, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("hello world foo bar");
+
+    const boundary = &[_]u21{ ' ', '\t' };
+
+    // word_left from middle of "world" -> start of "world"
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 8, .y = 0 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_left, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 6,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+
+    // word_left from start of "world" -> start of "hello"
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 10, .y = 0 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 6, .y = 0 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_left, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+
+    // word_left from start of "hello" -> stays put (no previous word)
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 5, .y = 0 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_left, boundary);
+
+        // Should stay at x=0 since there's no previous word
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+}
+
+test "Selection: adjust word_left with multiple spaces" {
+    const testing = std.testing;
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 10, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+    try s.testWriteString("hello   world");
+
+    const boundary = &[_]u21{ ' ', '\t' };
+
+    // word_left from middle of "world" -> start of "world" (skips within word)
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 12, .y = 0 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 10, .y = 0 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_left, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 8,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+
+    // word_left from start of "world" -> start of "hello" (skips multiple spaces)
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 12, .y = 0 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 8, .y = 0 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_left, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+}
+
+test "Selection: adjust word movement steps over wide characters" {
+    // A wide character fills two cells and only the head carries the
+    // codepoint; its spacer tail reads as blank. Word movement must skip
+    // that spacer rather than treat it as the end of the line, or it stops
+    // dead at the first CJK character or emoji it meets.
+    const testing = std.testing;
+    var s = try Screen.init(testing.io, testing.allocator, .{ .cols = 20, .rows = 10, .max_scrollback_bytes = 0 });
+    defer s.deinit();
+
+    // ab 日本 cd -- the wide pair occupies x=3..6.
+    try s.testWriteString("ab 日本 cd");
+
+    const boundary = &[_]u21{ ' ', '\t' };
+
+    // Rightwards, the whole wide word is crossed in one step and we land
+    // on the head of its last character, not on the spacer.
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 1, .y = 0 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_right, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 5,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+
+    // And the word after it is still reachable, which is the part that
+    // breaks if the spacer ends the walk.
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 0, .y = 0 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 5, .y = 0 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_right, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 9,
+            .y = 0,
+        } }, s.pages.pointFromPin(.screen, sel.end()).?);
+    }
+
+    // Leftwards, back over the wide pair to its first character.
+    {
+        var sel = Selection.init(
+            s.pages.pin(.{ .screen = .{ .x = 9, .y = 0 } }).?,
+            s.pages.pin(.{ .screen = .{ .x = 8, .y = 0 } }).?,
+            false,
+        );
+        defer sel.deinit(&s);
+        sel.adjust(&s, .word_left, boundary);
+
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 3,
             .y = 0,
         } }, s.pages.pointFromPin(.screen, sel.end()).?);
     }

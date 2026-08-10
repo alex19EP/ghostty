@@ -4439,7 +4439,7 @@ fn caretMove(
         .end => .end,
         .beginning_of_line => .beginning_of_line,
         .end_of_line => .end_of_line,
-    });
+    }, self.config.selection_word_chars);
 
     // Scroll the viewport to keep the caret in view.
     if (screen.caret_pin) |cp| caret_scroll: {
@@ -5751,7 +5751,9 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 .end => .end,
                 .beginning_of_line => .beginning_of_line,
                 .end_of_line => .end_of_line,
-            });
+                .word_left => .word_left,
+                .word_right => .word_right,
+            }, self.config.selection_word_chars);
 
             // If the selection endpoint is outside of the current viewpoint,
             // scroll it in to view. Note we always specifically use sel.end

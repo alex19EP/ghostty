@@ -524,6 +524,12 @@ pub const Action = union(enum) {
     ///     Adjust the selection to the beginning or the end of the line
     ///     respectively.
     ///
+    ///   - `word_left`, `word_right`
+    ///
+    ///     Adjust the selection one word to the left or right respectively,
+    ///     using `selection-word-chars` for the word boundaries. These stop
+    ///     at a hard line break, though a soft-wrapped line is crossed.
+    ///
     adjust_selection: AdjustSelection,
 
     /// Enter caret (keyboard navigation) mode. The caret is placed at the
@@ -1112,6 +1118,8 @@ pub const Action = union(enum) {
         end,
         beginning_of_line,
         end_of_line,
+        word_left,
+        word_right,
     };
 
     pub const MoveCaret = enum {

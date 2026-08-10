@@ -3001,7 +3001,13 @@ fn clampCaretToText(pin: *Pin) void {
     if (pin.x > end) pin.x = end;
 }
 
-pub fn moveCaret(self: *Screen, adjustment: Selection.Adjustment) void {
+/// `boundary` is the word separator set, used only by the `word_left` and
+/// `word_right` adjustments, which do nothing without it.
+pub fn moveCaret(
+    self: *Screen,
+    adjustment: Selection.Adjustment,
+    boundary: ?[]const u21,
+) void {
     const pin = self.caret_pin orelse return;
     switch (adjustment) {
         .up => if (pin.up(1)) |new_pin| {
@@ -3079,6 +3085,12 @@ pub fn moveCaret(self: *Screen, adjustment: Selection.Adjustment) void {
 
         // End of the text, not the last column. See `clampCaretToText`.
         .end_of_line => pin.x = rowTextEnd(pin.*),
+
+        // Same landing points as the selection adjustments: the far edge
+        // of the word, which is always a cell with text in it, so the
+        // caret never needs clamping back out of the trailing blanks.
+        .word_left => if (boundary) |b| Selection.adjustWord(pin, .left_up, b),
+        .word_right => if (boundary) |b| Selection.adjustWord(pin, .right_down, b),
     }
 
     self.dirty.caret = true;
