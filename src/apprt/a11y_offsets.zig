@@ -101,10 +101,15 @@ pub fn prefixSuffix(old_text: []const u8, new_text: []const u8) PrefixSuffixDiff
     return .{ .p = p, .s = s };
 }
 
-/// Look for a whole-line scroll up: a K > 0 at a `\n` boundary of `old`
-/// such that `new[0..|old|-K] == old[K..]`. Returns 0 if no such K
-/// exists. Since `\n` is ASCII, every candidate K is already a UTF-8
-/// codepoint boundary.
+/// Look for a whole-line shift: a K > 0 at a `\n` boundary of `old` such
+/// that `new[0..|old|-K] == old[K..]`. Returns 0 if no such K exists.
+/// Since `\n` is ASCII, every candidate K is already a UTF-8 codepoint
+/// boundary.
+///
+/// As written this finds an *upward* shift — K bytes left the top and the
+/// remainder moved up. The downward shift is the same relation with the
+/// snapshots exchanged, so `chooseDiff` finds it by calling this with the
+/// arguments swapped rather than by duplicating the scan.
 pub fn scrollK(old_text: []const u8, new_text: []const u8) usize {
     if (old_text.len == 0) return 0;
     var i: usize = 0;
@@ -121,6 +126,68 @@ pub fn scrollK(old_text: []const u8, new_text: []const u8) usize {
         }
     }
     return 0;
+}
+
+/// How to describe a viewport change to an AT client.
+pub const Diff = union(enum) {
+    /// Nothing to announce.
+    none,
+
+    /// The text shifted up by whole lines: `k` bytes left the top of the
+    /// viewport, everything below moved up to fill the gap, and new
+    /// content arrived at the bottom. This is the shape of command
+    /// output, and of scrolling forwards towards the prompt.
+    shift_up: usize,
+
+    /// The text shifted down by whole lines: `j` bytes of new content
+    /// arrived at the top and the tail fell off the bottom. This is the
+    /// shape of scrolling back into the scrollback.
+    shift_down: usize,
+
+    /// Anything else: replace the bytes between the common prefix and the
+    /// common suffix.
+    replace: PrefixSuffixDiff,
+};
+
+/// Pick the cheapest description of the change from `old_text` to
+/// `new_text`, measured in bytes the AT client has to be told about.
+///
+/// Cheapest-wins is what keeps the three shapes from poaching each
+/// other's cases. On a real whole-line shift, prefix/suffix covers nearly
+/// the whole viewport — every row moved — so a shift wins by a wide
+/// margin. But shift detection also matches spuriously on typing echo:
+/// typing `x` at a `$ ` prompt when earlier rows also end in `$ ` makes
+/// the last row of `old` a prefix of `new`, and there the shift is the
+/// expensive one. Neither side needs to know about the other; the byte
+/// count separates them.
+///
+/// Ties go to `shift_up`, which is by far the common case — a terminal
+/// spends most of its life scrolling forwards.
+pub fn chooseDiff(old_text: []const u8, new_text: []const u8) Diff {
+    const ps = prefixSuffix(old_text, new_text);
+    const ps_total = (old_text.len - ps.p - ps.s) + (new_text.len - ps.p - ps.s);
+
+    // Bytes off the top, plus whatever `new` grew past what survived.
+    const k = scrollK(old_text, new_text);
+    const up_total = if (k > 0)
+        k + (new_text.len - (old_text.len - k))
+    else
+        std.math.maxInt(usize);
+
+    // The mirror image: `j` bytes onto the top of `new`, plus whatever of
+    // `old` fell off the bottom.
+    const j = scrollK(new_text, old_text);
+    const down_total = if (j > 0)
+        j + (old_text.len - (new_text.len - j))
+    else
+        std.math.maxInt(usize);
+
+    if (k > 0 and up_total < ps_total and up_total <= down_total) {
+        return .{ .shift_up = k };
+    }
+    if (j > 0 and down_total < ps_total) return .{ .shift_down = j };
+    if (ps_total > 0) return .{ .replace = ps };
+    return .none;
 }
 
 /// How many terminal columns each codepoint of a snapshot occupies.
@@ -578,23 +645,124 @@ test "diff: scrollK returns 0 with no newline or no match" {
     try testing.expectEqual(@as(usize, 0), scrollK("a\nb\n", "totally different"));
 }
 
-test "diff: typing echo is cheaper as prefix/suffix than as scroll" {
-    // Repeated `$ ` prompts make the last old row a prefix of new, so
-    // scroll detection fires spuriously. The caller picks whichever diff
-    // emits fewer bytes; assert the sizes make prefix/suffix win.
-    const old_text = "$ \n$ \n$ ";
-    const new_text = "$ \n$ \n$ x";
+test "diff: scrollK detects a downward shift with the arguments swapped" {
+    // Scrolling back into the scrollback: `line0` arrives at the top and
+    // `line3` falls off the bottom. Nothing about this matches the upward
+    // scan, which is why `chooseDiff` runs the scan both ways.
+    const old_text = "line1\nline2\nline3\n";
+    const new_text = "line0\nline1\nline2\n";
+
+    try testing.expectEqual(@as(usize, 0), scrollK(old_text, new_text));
+    try testing.expectEqual(@as(usize, 6), scrollK(new_text, old_text));
+}
+
+test "diff: choose prefers a shift over replacing the viewport" {
+    const old_text = "line1\nline2\nline3\n";
+    const new_text = "line2\nline3\nline4\n";
+    try testing.expectEqual(Diff{ .shift_up = 6 }, chooseDiff(old_text, new_text));
+}
+
+test "diff: choose reports scrolling back as a downward shift" {
+    // The regression this whole path exists for. A one-line scroll back
+    // changes row 0 and drops the last row, so prefix/suffix keeps almost
+    // nothing and ends up rewriting the viewport twice over — which Orca
+    // reads out in full instead of announcing the one new line.
+    const old_text = "line1\nline2\nline3\n";
+    const new_text = "line0\nline1\nline2\n";
 
     const ps = prefixSuffix(old_text, new_text);
     const ps_total = (old_text.len - ps.p - ps.s) + (new_text.len - ps.p - ps.s);
+    const down_total = 6 + (old_text.len - (new_text.len - 6));
+    try testing.expect(down_total < ps_total);
 
-    const k = scrollK(old_text, new_text);
-    const scroll_total = if (k > 0)
-        k + (new_text.len - (old_text.len - k))
-    else
-        std.math.maxInt(usize);
+    try testing.expectEqual(Diff{ .shift_down = 6 }, chooseDiff(old_text, new_text));
+}
 
-    try testing.expect(ps_total < scroll_total);
+test "diff: choose handles a multi-line scroll back" {
+    const old_text = "c\nd\ne\nf\n";
+    const new_text = "a\nb\nc\nd\n";
+    // Two rows in at the top, two rows off the bottom.
+    try testing.expectEqual(Diff{ .shift_down = 4 }, chooseDiff(old_text, new_text));
+}
+
+test "diff: choose keeps typing echo as a replacement" {
+    // Repeated `$ ` prompts make the last old row a prefix of new, so the
+    // upward shift scan fires spuriously. Cheapest-wins has to reject it:
+    // one appended character must not be announced as a scroll.
+    const old_text = "$ \n$ \n$ ";
+    const new_text = "$ \n$ \n$ x";
+
+    const diff = chooseDiff(old_text, new_text);
+    try testing.expect(diff == .replace);
+    try testing.expectEqual(@as(usize, 8), diff.replace.p);
+    try testing.expectEqual(@as(usize, 0), diff.replace.s);
+}
+
+test "diff: choose says nothing for identical snapshots" {
+    try testing.expectEqual(Diff.none, chooseDiff("a\nb\n", "a\nb\n"));
+    try testing.expectEqual(Diff.none, chooseDiff("", ""));
+}
+
+test "diff: choose survives a viewport with no overlap at all" {
+    // A full-page jump shares no rows in either direction, so both shift
+    // scans come up empty and the replacement path has to carry it.
+    const old_text = "a\nb\nc\n";
+    const new_text = "x\ny\nz\n";
+    const diff = chooseDiff(old_text, new_text);
+    try testing.expect(diff == .replace);
+}
+
+test "diff: shift offsets stay on codepoint boundaries" {
+    // The shift amounts index into the snapshots to build codepoint
+    // counts, so a multi-byte row must not leave them mid-character.
+    const old_text = "héllo\n日本語\nend\n";
+    const new_text = "日本語\nend\ntail\n";
+
+    const diff = chooseDiff(old_text, new_text);
+    try testing.expect(diff == .shift_up);
+    const k = diff.shift_up;
+    try testing.expect(std.unicode.utf8ValidateSlice(old_text[0..k]));
+    try testing.expect(std.unicode.utf8ValidateSlice(old_text[k..]));
+
+    const back = chooseDiff(new_text, old_text);
+    try testing.expect(back == .shift_down);
+    const j = back.shift_down;
+    try testing.expect(std.unicode.utf8ValidateSlice(old_text[0..j]));
+    try testing.expect(std.unicode.utf8ValidateSlice(old_text[j..]));
+}
+
+test "diff: a downward shift describes a reachable edit" {
+    // Replay what `axEmitShiftDown` emits and check it reconstructs `new`:
+    // remove `old[kept..]`, then insert `new[0..j]` at the front.
+    const old_text = "line1\nline2\nline3\n";
+    const new_text = "line0\nline1\nline2\n";
+
+    const diff = chooseDiff(old_text, new_text);
+    const j = diff.shift_down;
+    const kept = new_text.len - j;
+    try testing.expect(kept <= old_text.len);
+
+    var buf: [64]u8 = undefined;
+    const rebuilt = try std.fmt.bufPrint(&buf, "{s}{s}", .{
+        new_text[0..j],
+        old_text[0..kept],
+    });
+    try testing.expectEqualStrings(new_text, rebuilt);
+}
+
+test "diff: an upward shift describes a reachable edit" {
+    const old_text = "line1\nline2\nline3\n";
+    const new_text = "line2\nline3\nline4\n";
+
+    const diff = chooseDiff(old_text, new_text);
+    const k = diff.shift_up;
+
+    var buf: [64]u8 = undefined;
+    const rebuilt = try std.fmt.bufPrint(&buf, "{s}{s}", .{
+        old_text[k..],
+        new_text[old_text.len - k ..],
+    });
+    try testing.expectEqualStrings(new_text, rebuilt);
 }
 
 test "grid: rowColToCp counts codepoints, not bytes" {
