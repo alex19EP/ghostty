@@ -1,9 +1,9 @@
 """What an AT client's copy of the text looks like after a burst of output.
 
-Reported independently by two testers on the Orca mailing list: after a lot
-of output — a compile, a `meson setup` — flat review loses the tail of the
-screen. The last rows and the prompt are simply not there, and switching
-away from the window and back restores them.
+Reported independently by three testers on the Orca mailing list: after a lot
+of output — a compile, a `meson setup`, a directory listing — flat review loses
+the tail of the screen. The last rows and the prompt are simply not there, and
+switching away from the window and back restores them.
 
 An AT client does not re-read the whole buffer when it changes; it applies
 the `remove`/`insert` events we emit to the copy it already has. So there
@@ -20,18 +20,65 @@ round-trip property over generated viewports, but only over the arithmetic;
 this runs it through the real GTK bridge, the real codepoint conversion and
 the real cache-aliasing that serves a deleted range back to the client
 while the cache already holds the text that replaced it.
+
+Both run twice, over an ASCII burst and a multi-byte one. The third reporter
+blamed non-ASCII specifically, and on ASCII the bug he describes is unhittable
+by construction: byte offset, codepoint offset and column are all the same
+number, so the conversions we would have to get wrong cannot be observed. The
+`unicode` case is the one where they disagree — see `UNICODE_BURST_SEED_SCRIPT`.
 """
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import pytest
 
 import harness
 
 
+@dataclass(frozen=True)
+class Case:
+    """A burst seed plus the strings its output can be recognised by."""
+
+    instance: str
+    seed: str
+    done: str
+    prompt: str
+    last_row: str
+
+
+CASES = {
+    "ascii": Case(
+        instance=f"{harness.INSTANCE_NAME}-ascii",
+        seed=harness.BURST_SEED_SCRIPT,
+        done=harness.BURST_DONE,
+        prompt=harness.BURST_PROMPT,
+        last_row=harness.burst_row(harness.BURST_ROW_FMT, harness.BURST_ROWS - 1),
+    ),
+    "unicode": Case(
+        instance=f"{harness.INSTANCE_NAME}-unicode",
+        seed=harness.UNICODE_BURST_SEED_SCRIPT,
+        done=harness.UNICODE_BURST_DONE,
+        prompt=harness.UNICODE_BURST_PROMPT,
+        last_row=harness.burst_row(
+            harness.UNICODE_BURST_ROW_FMT, harness.BURST_ROWS - 1
+        ),
+    ),
+}
+
+
+@pytest.fixture(scope="module", params=list(CASES), ids=list(CASES))
+def case(request) -> Case:
+    return CASES[request.param]
+
+
 @pytest.fixture(scope="module")
-def session(launch):
-    return launch(seed=harness.BURST_SEED_SCRIPT)
+def session(launch, case):
+    """One Ghostty per case. Both stay up until the module is done, so they
+    need distinct instance names to stay distinguishable, and the focus claim
+    in `primed` is what decides which one the keystrokes reach."""
+    return launch(seed=case.seed, instance=case.instance)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -64,38 +111,38 @@ def _replay(base: str, records: list[dict]) -> str:
     return text
 
 
-def test_text_keeps_the_tail_after_a_burst(session):
+def test_text_keeps_the_tail_after_a_burst(session, case):
     """The rows that arrived last are in the accessible text, prompt included."""
     _trigger_burst(session)
 
     text = session.wait_for_text(
-        lambda t: harness.BURST_DONE in t,
-        f"{harness.BURST_DONE!r} to reach the accessible text",
+        lambda t: case.done in t,
+        f"{case.done!r} to reach the accessible text",
         timeout=20.0,
     )
 
     rows = text.split("\n")
-    assert harness.BURST_DONE in rows, (
-        f"{harness.BURST_DONE!r} is not a row of its own.\n"
-        f"last rows: {rows[-5:]}"
+    assert case.done in rows, (
+        f"{case.done!r} is not a row of its own.\nlast rows: {rows[-5:]}"
     )
 
     # The prompt has no trailing newline, so it is the last row and it is
     # what the reporters said was missing.
-    done_at = rows.index(harness.BURST_DONE)
+    done_at = rows.index(case.done)
     assert rows[done_at + 1 :], "nothing after the done marker; the prompt row is gone"
-    assert rows[done_at + 1].startswith(harness.BURST_PROMPT), (
-        f"expected the prompt {harness.BURST_PROMPT!r} after the marker, "
+    assert rows[done_at + 1].startswith(case.prompt), (
+        f"expected the prompt {case.prompt!r} after the marker, "
         f"got {rows[done_at + 1]!r}"
     )
 
     # The burst scrolled past the viewport, so the rows just above the marker
     # must be the *last* ones printed, not an earlier stretch left stale.
-    last_row = f"burst {harness.BURST_ROWS - 1:03d} filler"
-    assert last_row in rows, f"{last_row!r} missing; text ends:\n" + "\n".join(rows[-5:])
+    assert case.last_row in rows, (
+        f"{case.last_row!r} missing; text ends:\n" + "\n".join(rows[-5:])
+    )
 
 
-def test_events_reconstruct_the_text_after_a_burst(session):
+def test_events_reconstruct_the_text_after_a_burst(session, case):
     """Replaying the emitted events onto the old text must yield the new text.
 
     If this fails, an AT client's copy has drifted from ours and will stay
@@ -107,8 +154,8 @@ def test_events_reconstruct_the_text_after_a_burst(session):
     with harness.Events("object:text-changed") as events:
         _trigger_burst(session)
         session.wait_for_text(
-            lambda t: harness.BURST_DONE in t,
-            f"{harness.BURST_DONE!r} to reach the accessible text",
+            lambda t: case.done in t,
+            f"{case.done!r} to reach the accessible text",
             timeout=20.0,
         )
         events.pump(3.0)
