@@ -91,6 +91,32 @@ printf '%s\\n' '{READY_MARKER}'
 exec cat
 """
 
+# Seed for test_burst.py. Waits for a line on stdin, then emits far more rows
+# than the window is tall as fast as the pty will take them, and finishes with a
+# marker and a bare prompt that has no trailing newline.
+#
+# The shape matters: two testers reported that after a burst of output the
+# accessible text loses its tail — the last rows and the prompt are missing from
+# Orca's flat review until the window is refocused. Reproducing that needs the
+# burst to arrive *after* the terminal is already up and idle, which is what the
+# `read` is for; a seed that prints at startup is a different case (the AT
+# client attaches to a screen that is already final).
+BURST_ROWS = 200
+BURST_DONE = "BURST-DONE"
+BURST_PROMPT = "$ "
+BURST_SEED_SCRIPT = f"""#!/bin/sh
+printf '%s\\n' '{READY_MARKER}'
+while read _cmd; do
+    i=0
+    while [ $i -lt {BURST_ROWS} ]; do
+        printf 'burst %03d filler\\n' "$i"
+        i=$((i + 1))
+    done
+    printf '%s\\n' '{BURST_DONE}'
+    printf '%s' '{BURST_PROMPT}'
+done
+"""
+
 CONFIG = f"""
 x11-instance-name = {INSTANCE_NAME}
 gtk-single-instance = false
