@@ -32,12 +32,18 @@ def launch():
 
     Most modules want the default seed and should use the `session` fixture.
     Take this one only when the test needs a different program behind the pty
-    (test_click.py turns on mouse reporting), and override `session` locally
-    so the tests still read the same.
+    (test_click.py turns on mouse reporting), a different environment
+    (test_scaling.py forces a HiDPI scale factor), or two terminals at once —
+    in which case give each a distinct `instance` — and override `session`
+    locally so the tests still read the same.
     """
     started = []
 
-    def _launch(seed: str = harness.SEED_SCRIPT) -> harness.Session:
+    def _launch(
+        seed: str = harness.SEED_SCRIPT,
+        instance: str = harness.INSTANCE_NAME,
+        env: dict | None = None,
+    ) -> harness.Session:
         import gi
 
         gi.require_version("Atspi", "2.0")
@@ -45,7 +51,7 @@ def launch():
 
         Atspi.init()
 
-        live = harness.Session(seed=seed)
+        live = harness.Session(seed=seed, instance=instance, env=env)
         started.append(live)
         try:
             live.start()
