@@ -2895,12 +2895,54 @@ pub const Surface = extern struct {
         if (cell_w <= 0 or cell_h <= 0) return 0;
 
         const rect = a11y_offsets.extentsCells(text, self.axCellWidths(), start, end);
+        const scale = self.axDeviceScale();
 
-        extents.f_origin.f_x = @as(f32, @floatFromInt(rect.col)) * cell_w;
-        extents.f_origin.f_y = @as(f32, @floatFromInt(rect.row)) * cell_h;
-        extents.f_size.f_width = @as(f32, @floatFromInt(rect.width_cols)) * cell_w;
-        extents.f_size.f_height = cell_h;
+        // Cell (0,0) is not at widget-local (0,0) — the renderer leaves a
+        // gutter, the same one `axSetCaretPosition` adds back when it turns
+        // an offset into a click.
+        const pad_left: f32 = @floatFromInt(core_surface.size.padding.left);
+        const pad_top: f32 = @floatFromInt(core_surface.size.padding.top);
+
+        extents.f_origin.f_x =
+            (pad_left + @as(f32, @floatFromInt(rect.col)) * cell_w) / scale;
+        extents.f_origin.f_y =
+            (pad_top + @as(f32, @floatFromInt(rect.row)) * cell_h) / scale;
+        extents.f_size.f_width =
+            @as(f32, @floatFromInt(rect.width_cols)) * cell_w / scale;
+        extents.f_size.f_height = cell_h / scale;
         return 1;
+    }
+
+    /// Device pixels per widget pixel, for converting between the renderer's
+    /// coordinate space and GTK's.
+    ///
+    /// `core_surface.size` is in device pixels — the renderer draws in them,
+    /// and `scaledCoordinates` multiplies pointer input up into them before
+    /// handing it to the core. GTK's accessibility coordinates are widget
+    /// space, so anything we derive from the cell metrics has to come back
+    /// down by the same factor. Mirroring `scaledCoordinates` rather than
+    /// using `getContentScale` is deliberate: the latter folds in the
+    /// gtk-xft-dpi font scale, which changes how large a cell *is* but not
+    /// which coordinate space it is measured in.
+    ///
+    /// At 1x the two spaces coincide, which is what kept this hidden — every
+    /// rect we reported was already correct, and the test harness runs under
+    /// Xvfb at 1x. On a scaled display an unconverted rect is inflated by the
+    /// scale factor, and Orca intersects each line's rect with the widget's
+    /// allocation to decide which lines are on screen. Inflated rows run out
+    /// of the box early, so flat review silently loses the bottom of the
+    /// viewport — including the row the prompt is on.
+    ///
+    /// Use the same helper `scaledCoordinates` does, not
+    /// `gtk_widget_get_scale_factor`. The renderer is sized from the
+    /// GdkSurface's *fractional* scale, and the widget scale factor is that
+    /// value rounded up to an integer: at 1.25x it reports 2, which would
+    /// shrink every rect to 62.5% of its row. The two only agree at integer
+    /// scales, which is all `test/gtk-a11y` (GDK_SCALE under Xvfb) can
+    /// exercise.
+    fn axDeviceScale(self: *Self) f32 {
+        const widget = self.private().render_surface.as(gtk.Widget);
+        return @floatCast(scale_util.widgetSurfaceScale(widget));
     }
 
     /// Map a widget-space point to a codepoint offset within the cached
@@ -2934,9 +2976,16 @@ pub const Surface = extern struct {
             return 0;
         }
 
+        // Exact inverse of `axGetExtents`: back into device pixels, then out
+        // of the renderer's gutter. `pointToGrid` clamps negatives to row and
+        // column zero, so a point inside the padding lands on the first cell
+        // rather than underflowing.
+        const scale = self.axDeviceScale();
+        const pad_left: f32 = @floatFromInt(core_surface.size.padding.left);
+        const pad_top: f32 = @floatFromInt(core_surface.size.padding.top);
         const grid = a11y_offsets.pointToGrid(
-            point.f_x,
-            point.f_y,
+            point.f_x * scale - pad_left,
+            point.f_y * scale - pad_top,
             cell_w,
             cell_h,
         );
