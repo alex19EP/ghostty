@@ -1013,3 +1013,262 @@ test "contents: every granularity yields valid UTF-8 on multi-byte text" {
         }
     }
 }
+
+/// A test-only model of the AT client's copy of our text.
+///
+/// An AT client does not re-read the whole buffer when it changes; it
+/// applies the `remove`/`insert` events we emit to the copy it already
+/// has. So the property that actually matters is not "is each event
+/// plausible" but "does replaying them reproduce the new text exactly".
+/// If it does not, the client's copy silently drifts from ours and stays
+/// wrong until something makes it rebuild from scratch -- which, in Orca,
+/// is a focus change.
+const EventModel = struct {
+    buf: []u8,
+
+    fn init(alloc: std.mem.Allocator, text: []const u8) !EventModel {
+        return .{ .buf = try alloc.dupe(u8, text) };
+    }
+
+    fn deinit(self: *EventModel, alloc: std.mem.Allocator) void {
+        alloc.free(self.buf);
+    }
+
+    /// `updateContents(.remove, start_cp, end_cp)`.
+    fn remove(
+        self: *EventModel,
+        alloc: std.mem.Allocator,
+        start_cp: usize,
+        end_cp: usize,
+    ) !void {
+        const s = utf8CpToByte(self.buf, start_cp);
+        const e = utf8CpToByte(self.buf, end_cp);
+        const out = try alloc.alloc(u8, self.buf.len - (e - s));
+        @memcpy(out[0..s], self.buf[0..s]);
+        @memcpy(out[s..], self.buf[e..]);
+        alloc.free(self.buf);
+        self.buf = out;
+    }
+
+    /// `updateContents(.insert, start_cp, end_cp)`. The client reads the
+    /// inserted bytes back out of us with `axGetContents`, which serves
+    /// the post-change text -- so the content comes from `new_text` at the
+    /// same codepoint range the event names.
+    fn insert(
+        self: *EventModel,
+        alloc: std.mem.Allocator,
+        start_cp: usize,
+        end_cp: usize,
+        new_text: []const u8,
+    ) !void {
+        const cs = utf8CpToByte(new_text, start_cp);
+        const ce = utf8CpToByte(new_text, end_cp);
+        const at = utf8CpToByte(self.buf, start_cp);
+        const out = try alloc.alloc(u8, self.buf.len + (ce - cs));
+        @memcpy(out[0..at], self.buf[0..at]);
+        @memcpy(out[at..][0 .. ce - cs], new_text[cs..ce]);
+        @memcpy(out[at + (ce - cs) ..], self.buf[at..]);
+        alloc.free(self.buf);
+        self.buf = out;
+    }
+};
+
+/// Replay the events `surface.zig` would emit for `chooseDiff(old, new)`.
+///
+/// This mirrors `axEmitShiftUp` / `axEmitShiftDown` / `axEmitPrefixSuffix`
+/// exactly, including which ranges are skipped when empty. Keep the two in
+/// step: if an emit function changes, change this and the fuzz test below
+/// will tell you whether the change still round-trips.
+fn replayDiff(
+    alloc: std.mem.Allocator,
+    old_text: []const u8,
+    new_text: []const u8,
+) ![]u8 {
+    var model = try EventModel.init(alloc, old_text);
+    errdefer model.deinit(alloc);
+
+    switch (chooseDiff(old_text, new_text)) {
+        .none => {},
+
+        .shift_up => |k| {
+            const removed_cp = utf8CpCount(old_text[0..k]);
+            const tail_cp = utf8CpCount(old_text[k..]);
+            const new_end_cp = utf8CpCount(new_text);
+            try model.remove(alloc, 0, removed_cp);
+            if (new_end_cp > tail_cp) {
+                try model.insert(alloc, tail_cp, new_end_cp, new_text);
+            }
+        },
+
+        .shift_down => |j| {
+            const kept = new_text.len - j;
+            const kept_cp = utf8CpCount(old_text[0..kept]);
+            const old_end_cp = utf8CpCount(old_text);
+            const inserted_cp = utf8CpCount(new_text[0..j]);
+            if (old_end_cp > kept_cp) {
+                try model.remove(alloc, kept_cp, old_end_cp);
+            }
+            try model.insert(alloc, 0, inserted_cp, new_text);
+        },
+
+        .replace => |ps| {
+            const p = ps.p;
+            const s = ps.s;
+            const start_cp = utf8CpCount(old_text[0..p]);
+            if (old_text.len - p - s != 0) {
+                try model.remove(
+                    alloc,
+                    start_cp,
+                    utf8CpCount(old_text[0 .. old_text.len - s]),
+                );
+            }
+            if (new_text.len - p - s != 0) {
+                try model.insert(
+                    alloc,
+                    start_cp,
+                    utf8CpCount(new_text[0 .. new_text.len - s]),
+                    new_text,
+                );
+            }
+        },
+    }
+
+    return model.buf;
+}
+
+fn expectRoundTrip(old_text: []const u8, new_text: []const u8) !void {
+    const alloc = testing.allocator;
+    const got = try replayDiff(alloc, old_text, new_text);
+    defer alloc.free(got);
+    testing.expectEqualStrings(new_text, got) catch |err| {
+        std.debug.print(
+            "round-trip failed\n  old: '{s}'\n  new: '{s}'\n  got: '{s}'\n  diff: {any}\n",
+            .{ old_text, new_text, got, chooseDiff(old_text, new_text) },
+        );
+        return err;
+    };
+}
+
+test "diff: events round-trip on the shapes we emit by name" {
+    // Command output: rows leave the top, new rows arrive at the bottom.
+    try expectRoundTrip("a\nb\nc\nd", "c\nd\ne\nf");
+    // Scrolling back: rows arrive at the top, the tail falls off.
+    try expectRoundTrip("c\nd\ne\nf", "a\nb\nc\nd");
+    // Typing echo at the prompt.
+    try expectRoundTrip("a\nb\n$ ", "a\nb\n$ x");
+    // A row rewritten in place (a progress bar).
+    try expectRoundTrip("a\n[--]\nc", "a\n[##]\nc");
+    // Nothing moved.
+    try expectRoundTrip("a\nb\nc", "a\nb\nc");
+    // Empty in both directions.
+    try expectRoundTrip("", "a\nb");
+    try expectRoundTrip("a\nb", "");
+    // Multi-byte content shifting, including a row that is pure emoji --
+    // the case where a byte-wise prefix/suffix would cut mid-codepoint.
+    try expectRoundTrip("日本\nx\n😀", "x\n😀\n日本");
+    try expectRoundTrip("│a\n├b", "├b\n│a");
+}
+
+test "diff: events round-trip over generated viewports" {
+    const alloc = testing.allocator;
+    // Deliberately includes characters that share leading bytes (│ and ├)
+    // and a 4-byte codepoint, since the prefix/suffix scan walks bytes and
+    // then backs up to a boundary.
+    const glyphs = [_][]const u8{ "a", "b", " ", "$", "é", "日", "│", "├", "😀" };
+
+    var prng = std.Random.DefaultPrng.init(0x9057e11);
+    const rand = prng.random();
+
+    var buf_old: std.ArrayList(u8) = .empty;
+    defer buf_old.deinit(alloc);
+    var buf_new: std.ArrayList(u8) = .empty;
+    defer buf_new.deinit(alloc);
+
+    const genRow = struct {
+        fn f(
+            a: std.mem.Allocator,
+            out: *std.ArrayList(u8),
+            r: std.Random,
+            gs: []const []const u8,
+        ) !void {
+            const n = r.uintLessThan(usize, 7);
+            for (0..n) |_| try out.appendSlice(a, gs[r.uintLessThan(usize, gs.len)]);
+        }
+    }.f;
+
+    var iter: usize = 0;
+    while (iter < 3000) : (iter += 1) {
+        buf_old.clearRetainingCapacity();
+        buf_new.clearRetainingCapacity();
+
+        const rows = 1 + rand.uintLessThan(usize, 10);
+        var row_starts: [11]usize = undefined;
+        for (0..rows) |i| {
+            if (i > 0) try buf_old.append(alloc, '\n');
+            row_starts[i] = buf_old.items.len;
+            try genRow(alloc, &buf_old, rand, &glyphs);
+        }
+        const old_text = buf_old.items;
+
+        switch (rand.uintLessThan(u8, 6)) {
+            // Identical.
+            0 => try buf_new.appendSlice(alloc, old_text),
+
+            // Shift up: drop the first `s` rows, append `s` fresh ones.
+            1 => {
+                const s = 1 + rand.uintLessThan(usize, @max(1, rows - 1));
+                if (s < rows) try buf_new.appendSlice(alloc, old_text[row_starts[s]..]);
+                for (0..s) |_| {
+                    if (buf_new.items.len > 0) try buf_new.append(alloc, '\n');
+                    try genRow(alloc, &buf_new, rand, &glyphs);
+                }
+            },
+
+            // Shift down: prepend `s` fresh rows, drop the last `s`.
+            2 => {
+                const s = 1 + rand.uintLessThan(usize, @max(1, rows - 1));
+                for (0..s) |_| {
+                    try genRow(alloc, &buf_new, rand, &glyphs);
+                    try buf_new.append(alloc, '\n');
+                }
+                if (s < rows) {
+                    const end = if (rows - s < rows) row_starts[rows - s] else old_text.len;
+                    const keep = if (end > 0) end - 1 else 0;
+                    try buf_new.appendSlice(alloc, old_text[0..keep]);
+                }
+            },
+
+            // Rewrite one row in place.
+            3 => {
+                const target = rand.uintLessThan(usize, rows);
+                for (0..rows) |i| {
+                    if (i > 0) try buf_new.append(alloc, '\n');
+                    if (i == target) {
+                        try genRow(alloc, &buf_new, rand, &glyphs);
+                    } else {
+                        const start = row_starts[i];
+                        const end = if (i + 1 < rows) row_starts[i + 1] - 1 else old_text.len;
+                        try buf_new.appendSlice(alloc, old_text[start..end]);
+                    }
+                }
+            },
+
+            // Typing echo: extend the last row.
+            4 => {
+                try buf_new.appendSlice(alloc, old_text);
+                try genRow(alloc, &buf_new, rand, &glyphs);
+            },
+
+            // An unrelated screen.
+            else => {
+                const n = 1 + rand.uintLessThan(usize, 10);
+                for (0..n) |i| {
+                    if (i > 0) try buf_new.append(alloc, '\n');
+                    try genRow(alloc, &buf_new, rand, &glyphs);
+                }
+            },
+        }
+
+        try expectRoundTrip(old_text, buf_new.items);
+    }
+}
