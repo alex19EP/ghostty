@@ -104,12 +104,13 @@ exec cat
 BURST_ROWS = 200
 BURST_DONE = "BURST-DONE"
 BURST_PROMPT = "$ "
+BURST_ROW_FMT = "burst %03d filler"
 BURST_SEED_SCRIPT = f"""#!/bin/sh
 printf '%s\\n' '{READY_MARKER}'
 while read _cmd; do
     i=0
     while [ $i -lt {BURST_ROWS} ]; do
-        printf 'burst %03d filler\\n' "$i"
+        printf '{BURST_ROW_FMT}\\n' "$i"
         i=$((i + 1))
     done
     printf '%s\\n' '{BURST_DONE}'
@@ -117,8 +118,46 @@ while read _cmd; do
 done
 """
 
-CONFIG = f"""
-x11-instance-name = {INSTANCE_NAME}
+# The same burst with nothing one byte wide in it.
+#
+# A third tester hit the missing-tail symptom under Nushell listing files with
+# Czech names, and read it as a non-ASCII problem. The burst above cannot say
+# whether he is right: it is pure ASCII, so for it a byte index, a codepoint
+# index and a column are the same number, and every way we could confuse the
+# three still produces the correct answer.
+#
+# So this seed makes them disagree, in the proportions his screen had. Box
+# drawing is three bytes and one column, Czech is two bytes and one column, and
+# the prompt ends in `〉` — Nushell's default indicator — which is three bytes
+# and *two* columns. The prompt row is the row he said was missing, so it is
+# the one that carries the wide character.
+UNICODE_BURST_DONE = "BURST-DONE-ŽLUŤOUČKÝ"
+UNICODE_BURST_PROMPT = "~/dokumenty/český〉"
+UNICODE_BURST_ROW_FMT = "│ %03d │ příliš žluťoučký kůň úpěl ďábelské ódy │"
+UNICODE_BURST_SEED_SCRIPT = f"""#!/bin/sh
+printf '%s\\n' '{READY_MARKER}'
+while read _cmd; do
+    i=0
+    while [ $i -lt {BURST_ROWS} ]; do
+        printf '{UNICODE_BURST_ROW_FMT}\\n' "$i"
+        i=$((i + 1))
+    done
+    printf '%s\\n' '{UNICODE_BURST_DONE}'
+    printf '%s' '{UNICODE_BURST_PROMPT}'
+done
+"""
+
+
+def burst_row(fmt: str, i: int) -> str:
+    """The row `fmt` prints for index `i`, as it lands in the viewport.
+
+    The seeds interpolate these formats into `sh`, so going through `%` here
+    keeps a test's idea of a row and the script's from drifting apart.
+    """
+    return fmt % i
+
+CONFIG_TEMPLATE = """
+x11-instance-name = {instance}
 gtk-single-instance = false
 gtk-titlebar = false
 window-decoration = none
@@ -199,8 +238,19 @@ def ghostty_binary() -> Path:
 class Session:
     """A running Ghostty plus the AT-SPI objects that describe it."""
 
-    def __init__(self, seed: str = SEED_SCRIPT) -> None:
+    def __init__(
+        self,
+        seed: str = SEED_SCRIPT,
+        instance: str = INSTANCE_NAME,
+        env: Optional[dict] = None,
+    ) -> None:
         self.seed_script = seed
+        # Both the AT-SPI application name and the WM_CLASS instance name, so
+        # a module running two Ghosttys at once can tell them apart. Sharing
+        # one name makes the second session find the first one's application
+        # object and wait for a ready marker that has long scrolled away.
+        self.instance = instance
+        self.extra_env = dict(env or {})
         self.tmpdir = Path(tempfile.mkdtemp(prefix="ghostty-a11y-"))
         self.proc: Optional[subprocess.Popen] = None
         self._app: Optional[Atspi.Accessible] = None
@@ -218,7 +268,9 @@ class Session:
 
         config_dir = self.tmpdir / "config" / "ghostty"
         config_dir.mkdir(parents=True)
-        (config_dir / "config").write_text(CONFIG)
+        (config_dir / "config").write_text(
+            CONFIG_TEMPLATE.format(instance=self.instance)
+        )
 
         seed = self.tmpdir / "seed.sh"
         seed.write_text(self.seed_script)
@@ -241,6 +293,7 @@ class Session:
                 "GDK_BACKEND": "x11",
             }
         )
+        env.update(self.extra_env)
         for key in ("data", "cache", "state", "home"):
             (self.tmpdir / key).mkdir(exist_ok=True)
 
@@ -256,7 +309,7 @@ class Session:
 
         try:
             self._app = _wait(
-                f"application {INSTANCE_NAME!r} on the accessibility bus",
+                f"application {self.instance!r} on the accessibility bus",
                 self._find_app,
             )
             self._terminal = _wait(
@@ -307,7 +360,7 @@ class Session:
         desktop = Atspi.get_desktop(0)
         for i in range(desktop.get_child_count()):
             child = desktop.get_child_at_index(i)
-            if child is not None and child.get_name() == INSTANCE_NAME:
+            if child is not None and child.get_name() == self.instance:
                 return child
         return None
 
@@ -366,6 +419,31 @@ class Session:
 
     # -- input ---------------------------------------------------------
 
+    # -- geometry ------------------------------------------------------
+
+    def range_extents(self, start: int, end: int):
+        """The rect covering a codepoint range, in window coordinates."""
+        return Atspi.Text.get_range_extents(
+            self.terminal, start, end, Atspi.CoordType.WINDOW
+        )
+
+    def extents(self):
+        """The terminal widget's own rect, in window coordinates.
+
+        GTK derives this from the widget's allocation instead of asking us for
+        it, which is what makes it an independent check on the rects we do
+        compute — and it is the box Orca intersects flat-review zones with.
+        """
+        return Atspi.Component.get_extents(self.terminal, Atspi.CoordType.WINDOW)
+
+    def offset_at_point(self, x: int, y: int) -> int:
+        """The codepoint offset at a window-coordinate point."""
+        return Atspi.Text.get_offset_at_point(
+            self.terminal, x, y, Atspi.CoordType.WINDOW
+        )
+
+    # -- input ----------------------------------------------------------
+
     def focus(self) -> None:
         """Give the toplevel X input focus.
 
@@ -377,8 +455,8 @@ class Session:
         focus gate — so a test that only reads or only listens does not need
         to call it. See test_focus.py.
 
-        Every session shares INSTANCE_NAME, so the xdotool search cannot tell
-        two of them apart. Resolve the window once and remember it: without
+        Sessions that share an instance name are indistinguishable to the
+        xdotool search, so resolve the window once and remember it: without
         that, calling `focus()` on the first session after a second one has
         started hands focus to the *second* window and silently tests the
         wrong terminal.
@@ -390,7 +468,7 @@ class Session:
                     w
                     for w in subprocess.run(
                         ["xdotool", "search", "--onlyvisible", "--classname",
-                         INSTANCE_NAME],
+                         self.instance],
                         capture_output=True,
                         text=True,
                     ).stdout.split()
