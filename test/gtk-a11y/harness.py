@@ -156,6 +156,30 @@ def burst_row(fmt: str, i: int) -> str:
     """
     return fmt % i
 
+# Seed for test_title_label.py. The pty sets a recognisable window title before
+# the ready marker, so the test can pick the header bar's title label out of
+# the accessible tree by name, then on each Enter changes the title as fast as
+# an agent's spinner would — an OSC 0 per millisecond — and restores the
+# marker when it is done. `sleep 0.001` paces it so the storm lasts seconds
+# rather than milliseconds; this is a race the test has to *sit inside*.
+TITLE_MARKER = "GHOSTTY-TITLE-MARKER"
+TITLE_SPINS = 3000
+TITLE_SPIN_DONE = "TITLE-SPIN-DONE"
+TITLE_SEED_SCRIPT = f"""#!/bin/sh
+printf '\\033]0;{TITLE_MARKER}\\007'
+printf '%s\\n' '{READY_MARKER}'
+while read _cmd; do
+    i=0
+    while [ $i -lt {TITLE_SPINS} ]; do
+        printf '\\033]0;spin %d\\007' "$i"
+        sleep 0.001
+        i=$((i + 1))
+    done
+    printf '\\033]0;{TITLE_MARKER}\\007'
+    printf '%s\\n' '{TITLE_SPIN_DONE}'
+done
+"""
+
 CONFIG_TEMPLATE = """
 x11-instance-name = {instance}
 gtk-single-instance = false
@@ -243,6 +267,7 @@ class Session:
         seed: str = SEED_SCRIPT,
         instance: str = INSTANCE_NAME,
         env: Optional[dict] = None,
+        config: str = "",
     ) -> None:
         self.seed_script = seed
         # Both the AT-SPI application name and the WM_CLASS instance name, so
@@ -251,6 +276,10 @@ class Session:
         # object and wait for a ready marker that has long scrolled away.
         self.instance = instance
         self.extra_env = dict(env or {})
+        # Appended after CONFIG_TEMPLATE; a later scalar key wins, so this is
+        # how a module opts back into something the template turns off (the
+        # header bar, for test_title_label.py).
+        self.extra_config = config
         self.tmpdir = Path(tempfile.mkdtemp(prefix="ghostty-a11y-"))
         self.proc: Optional[subprocess.Popen] = None
         self._app: Optional[Atspi.Accessible] = None
@@ -269,7 +298,7 @@ class Session:
         config_dir = self.tmpdir / "config" / "ghostty"
         config_dir.mkdir(parents=True)
         (config_dir / "config").write_text(
-            CONFIG_TEMPLATE.format(instance=self.instance)
+            CONFIG_TEMPLATE.format(instance=self.instance) + self.extra_config
         )
 
         seed = self.tmpdir / "seed.sh"

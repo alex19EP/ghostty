@@ -282,6 +282,7 @@ pub const Window = extern struct {
         tab_view: *adw.TabView,
         toolbar: *adw.ToolbarView,
         toast_overlay: *adw.ToastOverlay,
+        window_title: *adw.WindowTitle,
 
         pub var offset: c_int = 0;
     };
@@ -349,6 +350,26 @@ pub const Window = extern struct {
         // Set our window icon. We can't set this in the blueprint file
         // because its dependent on the build config.
         self.as(gtk.Window).setIconName(build_config.bundle_id);
+
+        // Work around a crash in GTK's GtkLabel accessibility code, see
+        // `propWindowTitleText`. The header bar's title and subtitle labels
+        // are the only labels whose text changes under normal use, and
+        // programs that animate the terminal title change them many times
+        // a second.
+        _ = gobject.Object.signals.notify.connect(
+            priv.window_title,
+            *Self,
+            propWindowTitleText,
+            self,
+            .{ .detail = "title" },
+        );
+        _ = gobject.Object.signals.notify.connect(
+            priv.window_title,
+            *Self,
+            propWindowTitleText,
+            self,
+            .{ .detail = "subtitle" },
+        );
 
         // Initialize our actions
         self.initActionMap();
@@ -1518,6 +1539,52 @@ pub const Window = extern struct {
         while (it.next()) |entry| entry.view.updateOcclusion();
     }
 
+    /// Runs whenever the header bar's title or subtitle text changes, in
+    /// the same call stack as the change.
+    ///
+    /// GTK's GtkLabel implementation of `GtkAccessibleText.get_extents`
+    /// (gtklabel.c, unchanged from 4.22 through main) reads the label's
+    /// cached PangoLayout *before* the call that would rebuild it:
+    ///
+    ///   layout = label->layout;                          // NULL after set_text
+    ///   gtk_label_get_layout_location (label, &lx, &ly); // ensures it...
+    ///   gdk_pango_layout_get_clip_region (layout, ...);  // ...too late
+    ///
+    /// `gtk_label_set_text` clears the layout and nothing rebuilds it until
+    /// the next frame measures the label. An AT-SPI GetRangeExtents or
+    /// GetCharacterExtents that reaches the label in between dereferences
+    /// NULL inside `cairo_region_get_extents` and kills the process. Orca
+    /// asks every label in the window for extents while building a
+    /// flat-review context, and agent CLIs rewrite the terminal title many
+    /// times a second, so a screen reader user reviewing that output hits
+    /// this within minutes.
+    ///
+    /// `gtk_label_get_layout` is public and calls `gtk_label_ensure_layout`,
+    /// which is the work the next frame would do anyway. Doing it here
+    /// closes the window completely: AT-SPI calls are only dispatched from
+    /// the main loop, and no iteration of it runs between the text change
+    /// and this handler returning.
+    fn propWindowTitleText(
+        title: *adw.WindowTitle,
+        _: *gobject.ParamSpec,
+        _: *Self,
+    ) callconv(.c) void {
+        ensureLabelLayouts(title.as(gtk.Widget));
+    }
+
+    /// Ensure the PangoLayout of every GtkLabel below `widget` exists. See
+    /// `propWindowTitleText` for why.
+    fn ensureLabelLayouts(widget: *gtk.Widget) void {
+        var next = widget.getFirstChild();
+        while (next) |child| : (next = child.getNextSibling()) {
+            if (gobject.ext.cast(gtk.Label, child)) |label| {
+                _ = label.getLayout();
+            } else {
+                ensureLabelLayouts(child);
+            }
+        }
+    }
+
     fn btnNewTab(_: *adw.SplitButton, self: *Self) callconv(.c) void {
         self.performBindingAction(.new_tab);
     }
@@ -2337,6 +2404,7 @@ pub const Window = extern struct {
             class.bindTemplateChildPrivate("tab_view", .{});
             class.bindTemplateChildPrivate("toolbar", .{});
             class.bindTemplateChildPrivate("toast_overlay", .{});
+            class.bindTemplateChildPrivate("window_title", .{});
 
             // Template Callbacks
             class.bindTemplateCallback("realize", &windowRealize);
