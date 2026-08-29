@@ -67,6 +67,7 @@ own config is not read.
 | `test_events.py` | Change events, the caret, and selection — needs a live pty. |
 | `test_selection.py` | Selection once output has scrolled off, and the NULL-`ranges` path GTK's AddSelection takes. Its pty prints 200 lines. |
 | `test_click.py` | Braille cursor routing: that the synthetic click lands on the routed-to cell. Its pty has mouse reporting on. |
+| `test_title_label.py` | The header bar title label survives extents queries while its text churns — a GTK `GtkLabel` NULL-layout crash Ghostty works around. Its pty storms the title; it turns the header bar on. |
 
 Each test module gets its own Ghostty instance, because `test_events.py` types
 into the terminal and would otherwise leak state into the others.

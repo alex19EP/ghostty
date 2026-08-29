@@ -39,7 +39,7 @@ template $GhosttyWindow: Adw.ApplicationWindow {
       Adw.HeaderBar {
         visible: bind template.headerbar-visible;
 
-        title-widget: Adw.WindowTitle {
+        title-widget: Adw.WindowTitle window_title {
           title: bind $computed_title(template.config, template.title, template.title-override) as <string>;
           // Blueprint auto-formatter won't let me split this into multiple
           // lines. Let me explain myself. All parameters to a closure are used
