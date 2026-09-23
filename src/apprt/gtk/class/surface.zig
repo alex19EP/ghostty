@@ -43,7 +43,6 @@ const SplitTree = @import("split_tree.zig").SplitTree;
 const RenderSurface = @import("render_surface.zig").RenderSurface;
 const i18n = @import("../../../os/i18n.zig");
 const global = @import("../../../global.zig");
-const gtk_version = @import("../gtk_version.zig");
 const Overrides = @import("Overrides.zig");
 
 const log = std.log.scoped(.gtk_ghostty_surface);
