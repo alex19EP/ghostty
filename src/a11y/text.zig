@@ -19,10 +19,19 @@
 
 const std = @import("std");
 const terminal = @import("../terminal/main.zig");
+const terminal_hyperlink = @import("../terminal/hyperlink.zig");
 const unicode = @import("../unicode/main.zig");
 const offsets = @import("offsets.zig");
 
+const log = std.log.scoped(.a11y_text);
+
 pub const Options = struct {
+    /// Whether `buildWithSink` looks up OSC 8 hyperlinks during the
+    /// walk. Callers skip it when the runtime cannot expose hyperlinks at
+    /// all (GTK older than 4.22, where the Hypertext interface isn't
+    /// registered), so nothing pays for lookups nothing will read.
+    track_links: bool = true,
+
     /// Where to record how many columns each emitted codepoint occupies
     /// (`offsets.CellWidths`). One byte is written per codepoint
     /// appended to the text, so the two stay index-aligned: 2 for a
@@ -127,7 +136,23 @@ const Snapshot = struct {
     }
 };
 
-/// Walk the viewport of `screen` and write its text to `writer`.
+/// A sink that discards every range. `build` walks with one, and because
+/// `buildWithSink` checks for it at comptime, that walk does no style or
+/// hyperlink lookups at all: the per-frame change probe needs to know
+/// whether the text moved, not what it looks like.
+pub const NullSink = struct {
+    pub fn commitLink(_: *NullSink, _: usize, _: usize, _: []const u8) void {}
+    pub fn commitStyleRun(_: *NullSink, _: usize, _: usize, _: terminal.Style) void {}
+    pub fn committedLinkCount(_: *NullSink) usize {
+        return 0;
+    }
+    pub fn linkOverlaps(_: *NullSink, _: usize, _: usize, _: usize) bool {
+        return false;
+    }
+};
+
+/// Walk the viewport of `screen` and write its text to `writer`, without
+/// collecting link or style ranges.
 ///
 /// The stream is appended to, not cleared, so callers reusing a buffer
 /// must clear it themselves.
@@ -136,13 +161,62 @@ pub fn build(
     screen: *terminal.Screen,
     opts: Options,
 ) std.Io.Writer.Error!Result {
+    var sink: NullSink = .{};
+    return buildWithSink(writer, screen, &sink, opts);
+}
+
+/// Like `build`, but also report the ranges the walk discovers to `sink`.
+/// Required methods, all offsets in codepoints:
+///
+///   fn commitLink(self, start_cp: usize, end_cp: usize, uri: []const u8) void
+///   fn commitStyleRun(self, start_cp: usize, end_cp: usize, style: terminal.Style) void
+///   fn committedLinkCount(self) usize
+///   fn linkOverlaps(self, start_cp: usize, end_cp: usize, limit: usize) bool
+///
+/// `uri` is borrowed from page memory and only valid for the duration of
+/// the call, so a sink that keeps it must copy it. Sinks swallow their own
+/// allocation failures: a dropped link degrades to plain text, which is
+/// better than failing the whole snapshot. The last two methods exist for
+/// `matchRegexLinks`.
+///
+/// Style runs cover maximal spans of identically styled, non-default
+/// codepoints; gaps between them (blanks, row separators) are default.
+/// Links close at blanks and at row ends, so each visual line of a link
+/// becomes its own navigable range.
+///
+/// The caller must hold the renderer mutex: this reads live page memory.
+pub fn buildWithSink(
+    writer: *std.Io.Writer,
+    screen: *terminal.Screen,
+    sink: anytype,
+    opts: Options,
+) std.Io.Writer.Error!Result {
     const pages = &screen.pages;
     const viewport_rows: usize = pages.rows;
+
+    // Comptime, so the text-only walk is the same code it was before
+    // ranges existed rather than paying for lookups it throws away.
+    const collect = @TypeOf(sink) != *NullSink;
+    const track_links = collect and opts.track_links;
 
     var snap: Snapshot = .{
         .text = writer,
         .widths = opts.widths,
     };
+
+    // The link run open on the current row. `id` is only unique within a
+    // page, which is enough: rows don't straddle pages and runs close at
+    // row ends. `uri` is borrowed from page memory.
+    var cur_link: ?struct {
+        id: terminal_hyperlink.Id,
+        start_cp: usize,
+        uri: []const u8,
+    } = null;
+
+    // The non-default style run open at the current codepoint. Identical
+    // adjacent cells coalesce, so a mostly-default viewport produces no
+    // runs and a styled one roughly one per SGR region per row.
+    var cur_style: ?StyleRun = null;
 
     // The position the AT-SPI caret reports. In caret mode the user is
     // driving the keyboard caret and the terminal cursor is irrelevant to
@@ -172,7 +246,8 @@ pub fn build(
     while (row_idx < viewport_rows) : (row_idx += 1) {
         if (row_idx > 0) {
             // A row separator, not a cell: it occupies no column, and
-            // column math never crosses it.
+            // column math never crosses it. It is default-styled.
+            if (collect) closeStyle(sink, &cur_style, snap.cp_count);
             try snap.addAscii('\n', 0, 1);
         }
 
@@ -180,6 +255,7 @@ pub fn build(
         const is_cursor_row = if (cursor) |c| row_idx == c.y else false;
 
         const cells = pin.cells(.all);
+        const page = pin.node.page();
 
         // A cursor on the tail half of a wide character belongs to the
         // character itself, which occupies the preceding column. A spacer
@@ -230,11 +306,20 @@ pub fn build(
 
             if (!cell.hasText()) {
                 blank_cells += 1;
+                // A blank splits a link run. One OSC 8 escape can bridge
+                // whitespace visually, but per-word ranges announce more
+                // cleanly and match what a sighted user perceives.
+                if (track_links) if (cur_link) |cl| {
+                    sink.commitLink(cl.start_cp, snap.cp_count, cl.uri);
+                    cur_link = null;
+                };
                 continue;
             }
 
-            // Flush accumulated blanks as spaces, one column each.
+            // Flush accumulated blanks as spaces, one column each. Spaces
+            // are default-styled, so they end any open style run.
             if (blank_cells > 0) {
+                if (collect) closeStyle(sink, &cur_style, snap.cp_count);
                 // Resolve a cursor that landed inside this blank run to
                 // its column within the about-to-be-emitted spaces.
                 if (cursor_blank_idx) |idx| {
@@ -243,6 +328,46 @@ pub fn build(
                 }
                 try snap.addAscii(' ', 1, blank_cells);
                 blank_cells = 0;
+            }
+
+            if (collect) {
+                // Cells without text took the branch above, so this one
+                // carries a codepoint; `hasStyling` is false for the
+                // default style.
+                const style: terminal.Style = if (cell.hasStyling())
+                    page.styles.get(page.memory, cell.style_id).*
+                else
+                    .{};
+                const same = if (cur_style) |cs| cs.style.eql(style) else style.default();
+                if (!same) {
+                    closeStyle(sink, &cur_style, snap.cp_count);
+                    if (!style.default()) cur_style = .{
+                        .start_cp = snap.cp_count,
+                        .style = style,
+                    };
+                }
+            }
+
+            if (track_links) {
+                // Resolve this cell's link before writing it, so a run
+                // that opens here starts at this cell's first codepoint.
+                const cell_link: ?terminal_hyperlink.Id = if (cell.hyperlink)
+                    page.lookupHyperlink(cell)
+                else
+                    null;
+                if (cur_link) |cl| {
+                    if (cell_link == null or cell_link.? != cl.id) {
+                        sink.commitLink(cl.start_cp, snap.cp_count, cl.uri);
+                        cur_link = null;
+                    }
+                }
+                if (cur_link == null) if (cell_link) |id| {
+                    cur_link = .{
+                        .id = id,
+                        .start_cp = snap.cp_count,
+                        .uri = page.hyperlink_set.get(page.memory, id).uri.slice(page.memory),
+                    };
+                };
             }
 
             // Columns this cell covers on screen. `.wide` cells are
@@ -272,12 +397,110 @@ pub fn build(
             cursor_byte = snap.end();
             cursor_blank_idx = null;
         }
+
+        // Links don't span rows: each visual line is its own range.
+        if (track_links) if (cur_link) |cl| {
+            sink.commitLink(cl.start_cp, snap.cp_count, cl.uri);
+            cur_link = null;
+        };
     }
+
+    if (collect) closeStyle(sink, &cur_style, snap.cp_count);
 
     return .{
         .cursor_byte = cursor_byte,
         .cp_count = snap.cp_count,
     };
+}
+
+/// A style run that has been opened but not yet committed.
+const StyleRun = struct {
+    start_cp: usize,
+    style: terminal.Style,
+};
+
+/// Commit the open style run, if any, as ending at `end_cp`.
+fn closeStyle(sink: anytype, cur: *?StyleRun, end_cp: usize) void {
+    const run = cur.* orelse return;
+    if (end_cp > run.start_cp) sink.commitStyleRun(run.start_cp, end_cp, run.style);
+    cur.* = null;
+}
+
+/// Scan already-built viewport `text` for configured regex links (bare
+/// URLs, user patterns) and commit each hit that doesn't overlap an OSC 8
+/// link to `sink`.
+///
+/// Run this after `buildWithSink`, so the OSC 8 ranges are already
+/// committed: when the two overlap the OSC 8 link wins, since its URI is
+/// explicit and the regex is a guess. Every pattern is matched regardless
+/// of its `highlight` mode. That gate decides when a sighted user sees a
+/// cue, not whether a region is a link, and a screen reader user cannot
+/// hover to reveal one.
+///
+/// `link_cfgs` is any slice whose elements have a `regex` field with
+/// oniguruma's `search` interface. This does not need the renderer mutex:
+/// it reads only `text` and the regexes, and the caller keeps those alive.
+pub fn matchRegexLinks(
+    text: []const u8,
+    link_cfgs: anytype,
+    sink: anytype,
+) void {
+    if (text.len == 0 or link_cfgs.len == 0) return;
+
+    // Only dedup against the OSC 8 links. Two configured regexes that
+    // both match a span both land, which announces no worse than a
+    // duplicated OSC 8 link would.
+    const osc8_end = sink.committedLinkCount();
+
+    for (link_cfgs) |*link_cfg| {
+        // Matches arrive in byte order, so the byte-to-codepoint
+        // conversion advances monotonically instead of rescanning from
+        // the start for every match.
+        var scan_byte: usize = 0;
+        var scan_cp: usize = 0;
+
+        var byte_offset: usize = 0;
+        while (byte_offset < text.len) {
+            var region = link_cfg.regex.search(
+                text[byte_offset..],
+                .{},
+            ) catch |err| switch (err) {
+                error.Mismatch => break,
+                else => {
+                    log.warn("regex link search failed: {}", .{err});
+                    break;
+                },
+            };
+            defer region.deinit();
+
+            const abs_start = byte_offset + @as(usize, @intCast(region.starts()[0]));
+            const abs_end = byte_offset + @as(usize, @intCast(region.ends()[0]));
+
+            // Step past a zero-width match, or `a*` loops forever.
+            byte_offset = if (abs_end > byte_offset) abs_end else byte_offset + 1;
+            if (abs_end <= abs_start) continue;
+
+            // A user regex may cross a row; clip at the newline so the
+            // link stays on one visual row like OSC 8 runs do.
+            const clipped_end = if (std.mem.indexOfScalar(u8, text[abs_start..abs_end], '\n')) |i|
+                abs_start + i
+            else
+                abs_end;
+            if (clipped_end <= abs_start) continue;
+
+            while (scan_byte < abs_start) : (scan_cp += 1) {
+                scan_byte += unicode.utf8.cpLen(text[scan_byte]);
+            }
+            const cp_start = scan_cp;
+            while (scan_byte < clipped_end) : (scan_cp += 1) {
+                scan_byte += unicode.utf8.cpLen(text[scan_byte]);
+            }
+            const cp_end = scan_cp;
+
+            if (sink.linkOverlaps(cp_start, cp_end, osc8_end)) continue;
+            sink.commitLink(cp_start, cp_end, text[abs_start..clipped_end]);
+        }
+    }
 }
 
 const testing = std.testing;
@@ -485,4 +708,240 @@ test "a11y text: cursor on a wide character's spacer lands on the character" {
     // accumulating a blank, so the deferred blank-run path can never
     // resolve it and it would otherwise fall through to end-of-row.
     try testing.expectEqual(2, result.cursor_byte.?);
+}
+
+/// Collects committed ranges so tests can assert on them, following the
+/// contract the GTK surface implements.
+const TestSink = struct {
+    alloc: std.mem.Allocator,
+    links: std.ArrayList(Link) = .empty,
+    style_runs: std.ArrayList(Range) = .empty,
+
+    const Link = struct {
+        start_cp: usize,
+        end_cp: usize,
+        uri: []const u8,
+    };
+
+    const Range = struct {
+        start_cp: usize,
+        end_cp: usize,
+    };
+
+    fn deinit(self: *TestSink) void {
+        for (self.links.items) |l| self.alloc.free(l.uri);
+        self.links.deinit(self.alloc);
+        self.style_runs.deinit(self.alloc);
+    }
+
+    pub fn commitLink(self: *TestSink, start_cp: usize, end_cp: usize, uri: []const u8) void {
+        if (start_cp >= end_cp) return;
+        const owned = self.alloc.dupe(u8, uri) catch return;
+        self.links.append(self.alloc, .{
+            .start_cp = start_cp,
+            .end_cp = end_cp,
+            .uri = owned,
+        }) catch self.alloc.free(owned);
+    }
+
+    pub fn commitStyleRun(self: *TestSink, start_cp: usize, end_cp: usize, _: terminal.Style) void {
+        self.style_runs.append(self.alloc, .{
+            .start_cp = start_cp,
+            .end_cp = end_cp,
+        }) catch {};
+    }
+
+    pub fn committedLinkCount(self: *TestSink) usize {
+        return self.links.items.len;
+    }
+
+    pub fn linkOverlaps(self: *TestSink, start_cp: usize, end_cp: usize, limit: usize) bool {
+        const n = @min(limit, self.links.items.len);
+        for (self.links.items[0..n]) |e| {
+            if (start_cp < e.end_cp and end_cp > e.start_cp) return true;
+        }
+        return false;
+    }
+};
+
+test "a11y text: OSC 8 link offsets are codepoints, not bytes" {
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 1 });
+    defer t.deinit(alloc);
+
+    // A multi-byte prefix makes byte and codepoint offsets diverge: the
+    // two arrows are 2 codepoints but 6 bytes. If the walk ever reports
+    // bytes, the start offset below reads 6 instead of 2.
+    try t.printString("\u{2192}\u{2192}");
+    try t.screens.active.startHyperlink("https://example.com", null);
+    try t.printString("link");
+    t.screens.active.endHyperlink();
+
+    var sink: TestSink = .{ .alloc = alloc };
+    defer sink.deinit();
+    var buffer: std.Io.Writer.Allocating = .init(alloc);
+    defer buffer.deinit();
+
+    _ = try buildWithSink(&buffer.writer, t.screens.active, &sink, .{});
+
+    try testing.expectEqualStrings("\u{2192}\u{2192}link", buffer.written());
+    try testing.expectEqual(1, sink.links.items.len);
+    const link = sink.links.items[0];
+    try testing.expectEqual(2, link.start_cp);
+    try testing.expectEqual(6, link.end_cp);
+    try testing.expectEqualStrings("https://example.com", link.uri);
+}
+
+test "a11y text: track_links=false skips link collection" {
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 1 });
+    defer t.deinit(alloc);
+
+    try t.screens.active.startHyperlink("https://example.com", null);
+    try t.printString("link");
+    t.screens.active.endHyperlink();
+
+    var sink: TestSink = .{ .alloc = alloc };
+    defer sink.deinit();
+    var buffer: std.Io.Writer.Allocating = .init(alloc);
+    defer buffer.deinit();
+
+    _ = try buildWithSink(&buffer.writer, t.screens.active, &sink, .{ .track_links = false });
+
+    try testing.expectEqualStrings("link", buffer.written());
+    try testing.expectEqual(0, sink.links.items.len);
+}
+
+test "a11y text: links close at row boundaries" {
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 4, .rows = 2 });
+    defer t.deinit(alloc);
+
+    // Soft-wraps across both rows; each visual row must become its own
+    // link so AT clients get one navigable range per line.
+    try t.screens.active.startHyperlink("https://example.com", null);
+    try t.printString("abcdefgh");
+    t.screens.active.endHyperlink();
+
+    var sink: TestSink = .{ .alloc = alloc };
+    defer sink.deinit();
+    var buffer: std.Io.Writer.Allocating = .init(alloc);
+    defer buffer.deinit();
+
+    _ = try buildWithSink(&buffer.writer, t.screens.active, &sink, .{});
+
+    try testing.expectEqualStrings("abcd\nefgh", buffer.written());
+    try testing.expectEqual(2, sink.links.items.len);
+    try testing.expectEqual(0, sink.links.items[0].start_cp);
+    try testing.expectEqual(4, sink.links.items[0].end_cp);
+    try testing.expectEqual(5, sink.links.items[1].start_cp);
+    try testing.expectEqual(9, sink.links.items[1].end_cp);
+}
+
+test "a11y text: style runs coalesce and close at gaps" {
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 1 });
+    defer t.deinit(alloc);
+
+    t.screens.active.cursor.style = .{ .flags = .{ .bold = true } };
+    try t.screens.active.manualStyleUpdate();
+    try t.printString("bold");
+    t.screens.active.cursor.style = .{};
+    try t.screens.active.manualStyleUpdate();
+    try t.printString(" plain");
+
+    var sink: TestSink = .{ .alloc = alloc };
+    defer sink.deinit();
+    var buffer: std.Io.Writer.Allocating = .init(alloc);
+    defer buffer.deinit();
+
+    _ = try buildWithSink(&buffer.writer, t.screens.active, &sink, .{});
+
+    try testing.expectEqualStrings("bold plain", buffer.written());
+    // The four bold cells collapse into one run; the plain tail emits none.
+    try testing.expectEqual(1, sink.style_runs.items.len);
+    try testing.expectEqual(0, sink.style_runs.items[0].start_cp);
+    try testing.expectEqual(4, sink.style_runs.items[0].end_cp);
+}
+
+test "a11y text: collecting ranges does not change the text" {
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 3 });
+    defer t.deinit(alloc);
+
+    t.screens.active.cursor.style = .{ .flags = .{ .bold = true } };
+    try t.screens.active.manualStyleUpdate();
+    try t.printString("styled");
+    t.screens.active.cursor.style = .{};
+    try t.screens.active.manualStyleUpdate();
+    t.carriageReturn();
+    try t.linefeed();
+    try t.screens.active.startHyperlink("https://example.com", null);
+    try t.printString("link");
+    t.screens.active.endHyperlink();
+
+    // The per-frame change probe walks without a sink to stay cheap. It is
+    // only a valid gate if its text is byte-identical to a full rebuild's.
+    var sink: TestSink = .{ .alloc = alloc };
+    defer sink.deinit();
+    var full: std.Io.Writer.Allocating = .init(alloc);
+    defer full.deinit();
+    const full_result = try buildWithSink(&full.writer, t.screens.active, &sink, .{});
+
+    var probe: std.Io.Writer.Allocating = .init(alloc);
+    defer probe.deinit();
+    const probe_result = try build(&probe.writer, t.screens.active, .{});
+
+    try testing.expectEqualStrings(full.written(), probe.written());
+    try testing.expectEqual(full_result.cp_count, probe_result.cp_count);
+    try testing.expectEqual(full_result.cursor_byte, probe_result.cursor_byte);
+
+    // The full walk really did find what the probe skips, so this isn't
+    // comparing two empty runs.
+    try testing.expectEqual(1, sink.links.items.len);
+    try testing.expectEqual(1, sink.style_runs.items.len);
+}
+
+test "a11y text: regex links dedup against OSC 8 ranges" {
+    const oni = @import("oniguruma");
+    const url = @import("../config/url.zig");
+
+    try oni.testing.ensureInit();
+
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 60, .rows = 1 });
+    defer t.deinit(alloc);
+
+    // The OSC 8 anchor text is itself a bare URL, so the regex pass would
+    // report it again if dedup were broken.
+    try t.screens.active.startHyperlink("https://example.com", null);
+    try t.printString("https://example.com");
+    t.screens.active.endHyperlink();
+    try t.printString(" https://ghostty.org");
+
+    var sink: TestSink = .{ .alloc = alloc };
+    defer sink.deinit();
+    var buffer: std.Io.Writer.Allocating = .init(alloc);
+    defer buffer.deinit();
+
+    _ = try buildWithSink(&buffer.writer, t.screens.active, &sink, .{});
+    try testing.expectEqual(1, sink.links.items.len);
+
+    var re = try oni.Regex.init(
+        url.regex,
+        .{},
+        oni.Encoding.utf8,
+        oni.Syntax.default,
+        null,
+    );
+    defer re.deinit();
+    // `var`: oniguruma's `search` takes a mutable `*Regex`.
+    var cfgs = [_]struct { regex: oni.Regex }{.{ .regex = re }};
+
+    matchRegexLinks(buffer.written(), &cfgs, &sink);
+
+    // The OSC 8 range survives; only the trailing bare URL is added.
+    try testing.expectEqual(2, sink.links.items.len);
+    try testing.expectEqual(20, sink.links.items[1].start_cp);
+    try testing.expectEqualStrings("https://ghostty.org", sink.links.items[1].uri);
 }

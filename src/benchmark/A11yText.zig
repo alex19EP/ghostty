@@ -6,21 +6,25 @@
 //! while holding `renderer_state.mutex`, so like `ScreenClone` this is
 //! a lock holder that directly impacts IO throughput.
 //!
-//! The two modes that matter mirror the two real per-frame paths:
-//! `probe` is `A11y.probeChanged`, which every rendered frame pays, and
-//! `text` is `A11y.refreshCache`, which only a frame that actually changed
-//! pays.
+//! The modes that matter mirror the real per-frame paths: `probe` is
+//! `A11y.probeChanged`, which every rendered frame pays, and `text`,
+//! `links` and `regex` are `A11y.refreshCache` on progressively newer GTK,
+//! which only a frame that actually changed pays.
 //!
-//! What this does NOT measure: the AT-SPI D-Bus traffic that follows a
-//! change, which needs a live GTK app and bus. The numbers here are a
-//! floor on the real per-frame cost, not the whole of it.
+//! What this does NOT measure: constructing the `GtkAccessibleHyperlink`
+//! GObjects the real sink creates per link, or the AT-SPI D-Bus traffic
+//! that follows a change. Those need a live GTK app and bus, so the
+//! numbers here are a floor on the real per-frame cost, not the whole of
+//! it.
 const A11yText = @This();
 
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
+const oni = @import("oniguruma");
 const terminalpkg = @import("../terminal/main.zig");
 const a11y = @import("../a11y/main.zig");
+const urlpkg = @import("../config/url.zig");
 const Benchmark = @import("Benchmark.zig");
 const options = @import("options.zig");
 const Terminal = terminalpkg.Terminal;
@@ -36,8 +40,13 @@ terminal: Terminal,
 probe_buf: std.Io.Writer.Allocating,
 probe_snapshot: std.Io.Writer.Allocating,
 /// Per-codepoint cell widths, mirroring `cached_widths`. Only the
-/// `text` mode fills this, because only `A11y.refreshCache` asks for it.
+/// rebuild modes fill this, because only `A11y.refreshCache` asks for it.
 widths: std.Io.Writer.Allocating,
+/// The ranges the rebuild modes collect, mirroring the surface's links
+/// and style runs.
+sink: Sink,
+/// Compiled link patterns. Only `regex` mode has any.
+links: []LinkConfig,
 
 pub const Options = struct {
     /// The type of snapshot work to perform.
@@ -54,8 +63,9 @@ pub const Options = struct {
 
     /// The data to read as a filepath. If this is "-" then we will read
     /// stdin. If this is unset, we synthesize a viewport containing
-    /// styled text and wide characters. The time to read this is not
-    /// part of the benchmark.
+    /// styled text, wide characters, OSC 8 hyperlinks and bare URLs so
+    /// that every mode has something to find. The time to read this is
+    /// not part of the benchmark.
     data: ?[]const u8 = null,
 };
 
@@ -66,15 +76,95 @@ pub const Mode = enum {
 
     /// The per-frame change probe: text into a retained scratch buffer,
     /// then a memcmp against the previous snapshot. No allocation, no
-    /// widths. This is what an *unchanged* frame costs once the change
-    /// gate is in place, and it is the number that matters most, because most
-    /// frames don't change.
+    /// widths, no ranges. This is what an *unchanged* frame costs once
+    /// the change gate is in place, and it is the number that matters
+    /// most, because most frames don't change.
     probe,
 
-    /// The full rebuild: the viewport walk with cell widths recorded,
-    /// plus the NUL-terminated dup that gets cached. This is what a
-    /// frame that actually changed costs.
+    /// The full rebuild without link tracking: the walk with cell widths
+    /// and style runs recorded, plus the NUL-terminated dup that gets
+    /// cached. This is what a changed frame costs on GTK older than
+    /// 4.22, where the Hypertext interface isn't available.
     text,
+
+    /// `text` with OSC 8 link tracking during the cell walk.
+    links,
+
+    /// `links`, then the configured link regexes over the built text.
+    /// This is a changed frame on a current GTK with a default config.
+    regex,
+};
+
+/// A stand-in for `Surface`'s derived link config. `matchRegexLinks`
+/// only requires a `regex` field.
+const LinkConfig = struct {
+    regex: oni.Regex,
+};
+
+/// Collects the ranges the walk discovers. The GTK sink additionally
+/// dups each URI and constructs a hyperlink GObject; this keeps the URI
+/// borrowed so it measures the walk rather than GObject churn.
+const Sink = struct {
+    alloc: Allocator,
+    links: std.ArrayList(Link) = .empty,
+    style_runs: std.ArrayList(StyleRun) = .empty,
+
+    const Link = struct {
+        start_cp: usize,
+        end_cp: usize,
+        uri: []const u8,
+    };
+
+    const StyleRun = struct {
+        start_cp: usize,
+        end_cp: usize,
+        style: terminalpkg.Style,
+    };
+
+    fn deinit(self: *Sink) void {
+        self.links.deinit(self.alloc);
+        self.style_runs.deinit(self.alloc);
+    }
+
+    fn reset(self: *Sink) void {
+        self.links.clearRetainingCapacity();
+        self.style_runs.clearRetainingCapacity();
+    }
+
+    pub fn commitLink(self: *Sink, start_cp: usize, end_cp: usize, uri: []const u8) void {
+        if (start_cp >= end_cp) return;
+        self.links.append(self.alloc, .{
+            .start_cp = start_cp,
+            .end_cp = end_cp,
+            .uri = uri,
+        }) catch {};
+    }
+
+    pub fn commitStyleRun(
+        self: *Sink,
+        start_cp: usize,
+        end_cp: usize,
+        style: terminalpkg.Style,
+    ) void {
+        self.style_runs.append(self.alloc, .{
+            .start_cp = start_cp,
+            .end_cp = end_cp,
+            .style = style,
+        }) catch {};
+    }
+
+    pub fn committedLinkCount(self: *Sink) usize {
+        return self.links.items.len;
+    }
+
+    pub fn linkOverlaps(self: *Sink, start_cp: usize, end_cp: usize, limit: usize) bool {
+        const n = @min(limit, self.links.items.len);
+        for (self.links.items[0..n]) |existing| {
+            if (start_cp < existing.end_cp and
+                end_cp > existing.start_cp) return true;
+        }
+        return false;
+    }
 };
 
 pub fn create(
@@ -83,6 +173,26 @@ pub fn create(
 ) !*A11yText {
     const ptr = try alloc.create(A11yText);
     errdefer alloc.destroy(ptr);
+
+    // Only the regex mode needs compiled patterns. `global.init` has
+    // already initialized oniguruma by the time we get here.
+    const links: []LinkConfig = links: {
+        if (opts.mode != .regex) break :links &.{};
+        const buf = try alloc.alloc(LinkConfig, 1);
+        errdefer alloc.free(buf);
+        buf[0] = .{ .regex = try oni.Regex.init(
+            urlpkg.regex,
+            .{},
+            oni.Encoding.utf8,
+            oni.Syntax.default,
+            null,
+        ) };
+        break :links buf;
+    };
+    errdefer if (links.len > 0) {
+        for (links) |*link| link.regex.deinit();
+        alloc.free(links);
+    };
 
     ptr.* = .{
         .opts = opts,
@@ -94,12 +204,17 @@ pub fn create(
         .probe_buf = .init(alloc),
         .probe_snapshot = .init(alloc),
         .widths = .init(alloc),
+        .sink = .{ .alloc = alloc },
+        .links = links,
     };
 
     return ptr;
 }
 
 pub fn destroy(self: *A11yText, alloc: Allocator) void {
+    for (self.links) |*link| link.regex.deinit();
+    if (self.links.len > 0) alloc.free(self.links);
+    self.sink.deinit();
     self.probe_buf.deinit();
     self.probe_snapshot.deinit();
     self.widths.deinit();
@@ -113,6 +228,8 @@ pub fn benchmark(self: *A11yText) Benchmark {
             .noop => stepNoop,
             .probe => stepProbe,
             .text => stepText,
+            .links => stepLinks,
+            .regex => stepRegex,
         },
         .setupFn = setup,
     });
@@ -152,14 +269,17 @@ fn setup(ptr: *anyopaque) Benchmark.Error!void {
         }
     } else {
         // No data file: synthesize a viewport that exercises every branch
-        // of the walk: a styled run, double-width cells, an interior
-        // blank gap and trailing blanks.
+        // of the walk: a styled run, double-width cells, an OSC 8
+        // hyperlink, a bare URL for the regex pass, an interior blank gap
+        // and trailing blanks.
         var s = self.terminal.vtStream();
         defer s.deinit();
         for (0..self.terminal.rows) |i| {
             if (i > 0) s.nextSlice("\r\n");
             s.nextSlice("\x1b[38;2;200;100;50mstyled\x1b[0m plain ");
-            s.nextSlice("日本語 wide   gap");
+            s.nextSlice("日本語 wide   gap ");
+            s.nextSlice("\x1b]8;;https://example.com/anchor\x1b\\osc8 link\x1b]8;;\x1b\\");
+            s.nextSlice(" see https://ghostty.org/docs");
         }
     }
 
@@ -228,26 +348,53 @@ fn stepProbe(ptr: *anyopaque) Benchmark.Error!void {
     }
 }
 
-/// Mirrors what `A11y.refreshCache` does on a frame that changed: a fresh
-/// buffer, the viewport walk with widths recorded, and the final
-/// NUL-terminated dup that gets cached. The allocation churn is
-/// intentional: the real path pays it too.
 fn stepText(ptr: *anyopaque) Benchmark.Error!void {
+    return stepBuild(ptr, false, false);
+}
+
+fn stepLinks(ptr: *anyopaque) Benchmark.Error!void {
+    return stepBuild(ptr, true, false);
+}
+
+fn stepRegex(ptr: *anyopaque) Benchmark.Error!void {
+    return stepBuild(ptr, true, true);
+}
+
+/// Mirrors what `A11y.refreshCache` does on a frame that changed: a fresh
+/// buffer, the viewport walk with widths and ranges recorded, the
+/// optional regex pass, and the final NUL-terminated dup that gets
+/// cached. The allocation churn is intentional: the real path pays it too.
+fn stepBuild(
+    ptr: *anyopaque,
+    comptime track_links: bool,
+    comptime match_regex: bool,
+) Benchmark.Error!void {
     const self: *A11yText = @ptrCast(@alignCast(ptr));
 
     for (0..iterations(self)) |_| {
         var buffer: std.Io.Writer.Allocating = .init(self.alloc);
         defer buffer.deinit();
         self.widths.clearRetainingCapacity();
+        self.sink.reset();
 
-        const result = a11y.text.build(
+        const result = a11y.text.buildWithSink(
             &buffer.writer,
             self.terminal.screens.active,
-            .{ .widths = &self.widths.writer },
+            &self.sink,
+            .{
+                .track_links = track_links,
+                .widths = &self.widths.writer,
+            },
         ) catch |err| {
             log.warn("error building a11y text err={}", .{err});
             return error.BenchmarkFailed;
         };
+
+        if (match_regex) a11y.text.matchRegexLinks(
+            buffer.written(),
+            self.links,
+            &self.sink,
+        );
 
         const text = self.alloc.dupeSentinel(u8, buffer.written(), 0) catch |err| {
             log.warn("error duplicating a11y text err={}", .{err});
@@ -258,5 +405,7 @@ fn stepText(ptr: *anyopaque) Benchmark.Error!void {
         std.mem.doNotOptimizeAway(result.cp_count);
         std.mem.doNotOptimizeAway(text.len);
         std.mem.doNotOptimizeAway(self.widths.written().len);
+        std.mem.doNotOptimizeAway(self.sink.links.items.len);
+        std.mem.doNotOptimizeAway(self.sink.style_runs.items.len);
     }
 }
