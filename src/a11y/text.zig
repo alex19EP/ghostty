@@ -144,12 +144,27 @@ pub fn build(
         .widths = opts.widths,
     };
 
+    // The position the AT-SPI caret reports. In caret mode the user is
+    // driving the keyboard caret and the terminal cursor is irrelevant to
+    // them, so the caret is what an assistive client has to be told about:
+    // navigating without selecting emits no selection change, so this is
+    // the only signal that anything moved. Outside caret mode the two are
+    // the same. Null when the caret has scrolled out of the viewport.
+    const cursor: ?struct { x: usize, y: usize } = cursor: {
+        if (screen.caret_mode) {
+            const pin = screen.caret_pin orelse break :cursor null;
+            const pt = pages.pointFromPin(.viewport, pin.*) orelse
+                break :cursor null;
+            break :cursor .{ .x = pt.viewport.x, .y = pt.viewport.y };
+        }
+        break :cursor .{ .x = screen.cursor.x, .y = screen.cursor.y };
+    };
+
     // Where the AT-SPI caret belongs. Null until the walk reaches the
     // cursor's row, and still null afterwards if that row never came out
-    // of the iterator.
+    // of the iterator or the cursor is not in the viewport at all.
     var cursor_byte: ?usize = null;
-    const cursor_x = screen.cursor.x;
-    const cursor_y = screen.cursor.y;
+    const cursor_x = if (cursor) |c| c.x else 0;
 
     const tl_pin = pages.getTopLeft(.viewport);
     var row_it = tl_pin.rowIterator(.right_down, null);
@@ -162,7 +177,7 @@ pub fn build(
         }
 
         const pin = row_it.next() orelse continue;
-        const is_cursor_row = row_idx == cursor_y;
+        const is_cursor_row = if (cursor) |c| row_idx == c.y else false;
 
         const cells = pin.cells(.all);
 
@@ -420,6 +435,34 @@ test "a11y text: cursor inside an interior blank run lands on its column" {
     // Byte 3 is the second of the four spaces, the cell the cursor is
     // on, not the start or the end of the run.
     try testing.expectEqual(3, result.cursor_byte.?);
+}
+
+test "a11y text: caret mode reports the caret, not the terminal cursor" {
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 2 });
+    defer t.deinit(alloc);
+
+    try t.printString("first");
+    t.carriageReturn();
+    try t.linefeed();
+    try t.printString("second");
+
+    const screen = t.screens.active;
+    try screen.enterCaretMode();
+    screen.moveCaret(.up, null);
+
+    var buffer: std.Io.Writer.Allocating = .init(alloc);
+    defer buffer.deinit();
+
+    const result = try build(&buffer.writer, screen, .{});
+
+    // The terminal cursor is still after "second", but the caret moved up
+    // a row. Moving the caret emits no selection change, so the reported
+    // caret offset is the only thing that tells a client it moved.
+    try testing.expectEqualStrings("first\nsecond", buffer.written());
+    const caret_pt = screen.pages.pointFromPin(.viewport, screen.caret_pin.?.*).?;
+    try testing.expectEqual(0, caret_pt.viewport.y);
+    try testing.expectEqual(caret_pt.viewport.x, result.cursor_byte.?);
 }
 
 test "a11y text: cursor on a wide character's spacer lands on the character" {
