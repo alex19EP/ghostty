@@ -32,6 +32,7 @@ const ResizeOverlay = @import("resize_overlay.zig").ResizeOverlay;
 const SearchOverlay = @import("search_overlay.zig").SearchOverlay;
 const KeyStateOverlay = @import("key_state_overlay.zig").KeyStateOverlay;
 const A11y = @import("surface_a11y.zig");
+const a11y_hypertext = @import("../a11y_hypertext.zig");
 const ChildExited = @import("surface_child_exited.zig").SurfaceChildExited;
 const ClipboardConfirmationDialog = @import("clipboard_confirmation_dialog.zig").ClipboardConfirmationDialog;
 const TitleDialog = @import("title_dialog.zig").TitleDialog;
@@ -55,6 +56,7 @@ pub const Surface = extern struct {
     pub const Implements = [_]type{
         gtk.Scrollable,
         gtk.AccessibleText,
+        a11y_hypertext.AccessibleHypertextImpl,
     };
     pub const getGObjectType = gobject.ext.defineClass(Self, .{
         .name = "GhosttySurface",
@@ -66,6 +68,12 @@ pub const Surface = extern struct {
             gobject.ext.implement(gtk.Scrollable, .{}),
             gobject.ext.implement(gtk.AccessibleText, .{
                 .init = &A11y.initAccessibleTextInterface,
+            }),
+            // GtkAccessibleHypertext is GTK 4.22+ and its GType is
+            // resolved at runtime (see `a11y_hypertext`). On older GTK it
+            // is 0, and GObject declines to add the interface.
+            gobject.ext.implement(a11y_hypertext.AccessibleHypertextImpl, .{
+                .init = &A11y.initAccessibleHypertextInterface,
             }),
         },
     });
