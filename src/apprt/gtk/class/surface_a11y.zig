@@ -1,5 +1,6 @@
 //! Accessibility support for the Surface class: the GtkAccessibleText
-//! implementation and its state, embedded in the Surface's private data.
+//! and GtkAccessibleHypertext implementations and their state, embedded
+//! in the Surface's private data.
 //!
 //! Every offset crossing this boundary is a UTF-8 codepoint index, never
 //! a byte index, per the AT-SPI Text contract. `a11y.offsets` owns that
@@ -7,6 +8,7 @@
 const A11y = @This();
 
 const std = @import("std");
+const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const glib = @import("glib");
 const gobject = @import("gobject");
@@ -17,6 +19,7 @@ const a11y = @import("../../../a11y/main.zig");
 const global = @import("../../../global.zig");
 const terminal = @import("../../../terminal/main.zig");
 const unicode = @import("../../../unicode/main.zig");
+const a11y_hypertext = @import("../a11y_hypertext.zig");
 const gtk_version = @import("../gtk_version.zig");
 const scale_util = @import("../scale.zig");
 const Application = @import("application.zig").Application;
@@ -55,7 +58,57 @@ cache_stale: bool = false,
 /// not allocate once it has grown to viewport size.
 probe_buf: std.ArrayList(u8) = .empty,
 
+/// Links in `cached_text`, rebuilt with it. Only populated when
+/// `a11y_hypertext.available` (GTK >= 4.22). Each owns its URI and a
+/// strong reference on its hyperlink object.
+links: std.ArrayList(Link) = .empty,
+
+/// The previous refresh's `links`, held only for the duration of a
+/// `refreshCache` so `Sink.commitLink` can reuse unchanged hyperlinks
+/// in place. Rebuilding every hyperlink on every refresh was the cause
+/// of a use-after-free: Orca queues `GetLink(idx)` from an older frame's
+/// link count, and a hyperlink freed before that query dispatches made
+/// GTK's bridge crash in `gtk_accessible_get_at_context`, taking Orca
+/// with it. Empty outside a refresh.
+links_prev: std.ArrayList(Link) = .empty,
+
+/// How many `links_prev` entries were reused this refresh. Reuse is
+/// positional, so this only grows.
+links_prev_consumed: usize = 0,
+
+/// Set once a refresh hits a link that differs from the previous one at
+/// the same index. The rest of `links_prev` is disposed on the spot and
+/// no further reuse is attempted.
+links_prev_frozen: bool = false,
+
+/// An inert, empty hyperlink returned when a client asks for a link
+/// index past the end. That happens: Orca queues `GetLink(idx)` after a
+/// `GetNLinks` that reported more, and the link set can shrink before
+/// the query dispatches. GTK's bridge serializes our return value with
+/// no null check, so neither NULL nor an out-of-bounds read is survivable.
+/// Created on first use.
+link_sentinel: ?*a11y_hypertext.AccessibleHyperlink = null,
+
+/// A half-open codepoint range.
+pub const Range = struct {
+    start: c_uint,
+    end: c_uint,
+};
+
+pub const Link = struct {
+    range: Range,
+    uri: [:0]u8,
+    obj: *a11y_hypertext.AccessibleHyperlink,
+};
+
 pub fn deinit(self: *A11y, alloc: Allocator) void {
+    // `links_prev` is empty outside a refresh, but drain it anyway in case
+    // a refresh was interrupted.
+    clearLinks(&self.links, alloc);
+    self.links.deinit(alloc);
+    disposeLinksFrom(&self.links_prev, 0, alloc);
+    self.links_prev.deinit(alloc);
+    if (self.link_sentinel) |s| unparentAndUnref(s);
     self.probe_buf.deinit(alloc);
     self.cached_widths.deinit(alloc);
     if (self.cached_text) |v| alloc.free(v);
@@ -81,17 +134,17 @@ pub fn frameRendered(self: *A11y, surface: *Surface) void {
 
 /// Install the parts of GtkAccessibleText this surface implements.
 /// Slots left alone keep GTK's `default_init` implementations, which
-/// decline gracefully (no selection, no attributes).
+/// decline gracefully.
 pub fn initAccessibleTextInterface(iface: *gtk.AccessibleTextInterface) callconv(.c) void {
     // Present since 4.14, which is the oldest GTK we run against.
     iface.f_get_contents = &getContents;
     iface.f_get_contents_at = &getContentsAt;
     iface.f_get_caret_position = &getCaretPosition;
 
-    // `get_extents` and `get_offset` are 4.16 additions.
-    // While they are accessible with current bindings, we need to make sure
-    // we do not access invalid memory when running with older GTK versions
-    // by writing to fields that don't yet exist.
+    // Later slots exist in our bindings, but `G_DEFINE_INTERFACE`
+    // allocates the vtable at the *running* GTK's size, so on an older
+    // runtime writing them would scribble past the allocation. Gate on the
+    // runtime version, not the bindings.
     if (gtk_version.runtimeAtLeast(4, 16, 0)) {
         iface.f_get_extents = &getExtents;
         iface.f_get_offset = &getOffset;
@@ -230,6 +283,17 @@ fn refreshCache(self: *A11y, surface: *Surface) ?[:0]const u8 {
 
     const core_surface = surface.core() orelse return null;
 
+    // Move the previous refresh's links aside for `Sink.commitLink` to
+    // reuse. The defer disposes whatever wasn't reused on every exit
+    // path, so an early return can't leak them or trip the asserts on
+    // the next refresh.
+    assert(self.links_prev.items.len == 0);
+    assert(self.links_prev_consumed == 0);
+    assert(!self.links_prev_frozen);
+    self.links_prev = self.links;
+    self.links = .empty;
+    defer self.finalizeLinksPrev(alloc);
+
     // Widths are rebuilt in lockstep with the text below; `build` only
     // appends, so the retained list must start empty to stay aligned
     // with the fresh text. The writer takes over the list's memory and
@@ -241,6 +305,11 @@ fn refreshCache(self: *A11y, surface: *Surface) ?[:0]const u8 {
     var buffer: std.Io.Writer.Allocating = .init(alloc);
     defer buffer.deinit();
 
+    // Without the Hypertext interface nothing can read links, so don't
+    // look them up.
+    const track_links = a11y_hypertext.available;
+    var sink: Sink = .{ .a11y = self, .surface = surface, .alloc = alloc };
+
     // The renderer mutex covers only the walk; everything after this
     // point reads `buffer`, which is our own memory.
     const result = result: {
@@ -250,15 +319,33 @@ fn refreshCache(self: *A11y, surface: *Surface) ?[:0]const u8 {
         const screen: *terminal.Screen =
             core_surface.renderer_state.terminal.screens.active;
 
-        break :result a11y.text.build(
+        break :result a11y.text.buildWithSink(
             &buffer.writer,
             screen,
-            .{ .widths = &widths.writer },
+            &sink,
+            .{
+                .track_links = track_links,
+                .widths = &widths.writer,
+            },
         ) catch |err| {
             log.warn("ax text build failed: {}", .{err});
             return null;
         };
     };
+
+    // Configured regex links, after the walk so they dedup against the
+    // OSC 8 links it committed. Deliberately outside the renderer mutex:
+    // this touches only `buffer` and the `oni.Regex` objects in the
+    // derived config, which the mutex never protected anyway, because
+    // `Surface.changeConfig` swaps the config without taking it. What
+    // keeps them alive is that the swap and this run on the same (main)
+    // thread. Holding the lock here would cost the IO thread ~10x the
+    // walk itself on a large viewport for no safety benefit.
+    if (track_links) a11y.text.matchRegexLinks(
+        buffer.written(),
+        core_surface.config.links,
+        &sink,
+    );
 
     const text = alloc.dupeSentinel(u8, buffer.written(), 0) catch return null;
     self.cached_text = text;
@@ -279,6 +366,135 @@ fn refreshCache(self: *A11y, surface: *Surface) ?[:0]const u8 {
     }
 
     return self.cached_text;
+}
+
+/// The sink `a11y.text.buildWithSink` and `matchRegexLinks` report into
+/// during a `refreshCache`. It runs under the renderer mutex, so it
+/// must not do anything that can call back into us; see `commitLink`.
+const Sink = struct {
+    a11y: *A11y,
+    surface: *Surface,
+    alloc: Allocator,
+
+    /// Record a link range. When the previous refresh had an identical
+    /// link at the same index its hyperlink object is moved over as is,
+    /// keeping its AT-SPI bus path alive across the frame. Reuse is by
+    /// index because a hyperlink's index is construct-only. Allocation
+    /// failure drops the link, which degrades to plain text.
+    pub fn commitLink(self: *Sink, start_cp: usize, end_cp: usize, uri: []const u8) void {
+        if (start_cp >= end_cp) return;
+
+        const state = self.a11y;
+        const range: Range = .{ .start = @intCast(start_cp), .end = @intCast(end_cp) };
+        const target_idx = state.links.items.len;
+
+        if (!state.links_prev_frozen and target_idx < state.links_prev.items.len) reuse: {
+            const candidate = state.links_prev.items[target_idx];
+            if (std.meta.eql(candidate.range, range) and
+                std.mem.eql(u8, candidate.uri, uri))
+            {
+                state.links.append(self.alloc, candidate) catch |err| {
+                    log.warn("ax link append failed: {}", .{err});
+                    break :reuse;
+                };
+                state.links_prev_consumed = target_idx + 1;
+                return;
+            }
+
+            // Fall through to a fresh hyperlink, and dispose the rest of
+            // the previous set now so the old object at this index
+            // doesn't shadow the new one on the bus.
+        }
+        if (target_idx < state.links_prev.items.len) {
+            state.links_prev_frozen = true;
+            disposeLinksFrom(&state.links_prev, state.links_prev_consumed, self.alloc);
+        }
+
+        const uri_owned = self.alloc.dupeSentinel(u8, uri, 0) catch |err| {
+            log.warn("ax link uri dup failed: {}", .{err});
+            return;
+        };
+
+        var bounds: gtk.AccessibleTextRange = .{
+            .f_start = range.start,
+            .f_length = range.end - range.start,
+        };
+
+        // Not parented here: setting the parent realizes the hyperlink's
+        // AT context, which can make the client query us back, re-entering
+        // `refreshCache` and deadlocking on the renderer mutex we're under.
+        // `wireLinks` parents them afterwards.
+        const obj = a11y_hypertext.hyperlinkNew(
+            @ptrCast(self.surface),
+            @intCast(target_idx),
+            uri_owned.ptr,
+            &bounds,
+        );
+
+        state.links.append(self.alloc, .{
+            .range = range,
+            .uri = uri_owned,
+            .obj = obj,
+        }) catch |err| {
+            log.warn("ax link append failed: {}", .{err});
+            self.alloc.free(uri_owned);
+            obj.unref();
+        };
+    }
+
+    /// Text attributes aren't exposed, so style runs are dropped.
+    pub fn commitStyleRun(_: *Sink, _: usize, _: usize, _: terminal.Style) void {}
+
+    pub fn committedLinkCount(self: *Sink) usize {
+        return self.a11y.links.items.len;
+    }
+
+    /// Whether `[start_cp, end_cp)` intersects any of the first `limit`
+    /// links. `limit` is clamped because a failed commit can leave the
+    /// list shorter than the caller's snapshot of its length.
+    pub fn linkOverlaps(self: *Sink, start_cp: usize, end_cp: usize, limit: usize) bool {
+        const links = self.a11y.links.items;
+        for (links[0..@min(limit, links.len)]) |existing| {
+            if (start_cp < existing.range.end and
+                end_cp > existing.range.start) return true;
+        }
+        return false;
+    }
+};
+
+/// Unparent, then unref. The order matters: an unparented hyperlink
+/// tears down its AT context and leaves the bus. Unreffed while still
+/// parented, it is freed while the bridge keeps its bus path pointing at
+/// it, and the next call on that path crashes the bridge and Orca.
+fn unparentAndUnref(obj: *a11y_hypertext.AccessibleHyperlink) void {
+    const accessible: *gtk.Accessible = @ptrCast(@alignCast(obj));
+    accessible.setAccessibleParent(null, null);
+    obj.unref();
+}
+
+/// Release every link in `list` and empty it.
+fn clearLinks(list: *std.ArrayList(Link), alloc: Allocator) void {
+    disposeLinksFrom(list, 0, alloc);
+}
+
+/// Release the links in `list` from index `from` onwards and truncate it
+/// there. A second call with the same `from` is a no-op.
+fn disposeLinksFrom(list: *std.ArrayList(Link), from: usize, alloc: Allocator) void {
+    if (from >= list.items.len) return;
+    for (list.items[from..]) |link| {
+        unparentAndUnref(link.obj);
+        alloc.free(link.uri);
+    }
+    list.shrinkRetainingCapacity(from);
+}
+
+/// End-of-refresh cleanup: dispose the previous links that weren't
+/// reused and reset the reuse state for the next refresh.
+fn finalizeLinksPrev(self: *A11y, alloc: Allocator) void {
+    disposeLinksFrom(&self.links_prev, self.links_prev_consumed, alloc);
+    self.links_prev.clearAndFree(alloc);
+    self.links_prev_consumed = 0;
+    self.links_prev_frozen = false;
 }
 
 /// Cheap per-frame check for "could anything an AT client cares about
@@ -609,4 +825,98 @@ fn getCaretPosition(
     const self = surface.a11y();
     _ = self.refreshCache(surface);
     return self.cached_cursor_offset;
+}
+
+//---------------------------------------------------------------
+// GtkAccessibleHypertext interface implementation (GTK 4.22+)
+//
+// Orca reads these directly to announce links inline as the caret or
+// flat review crosses them; no link-role children are needed. On older
+// GTK the interface is never registered (see `a11y_hypertext`).
+
+pub fn initAccessibleHypertextInterface(
+    iface: *a11y_hypertext.AccessibleHypertextInterface,
+) callconv(.c) void {
+    iface.f_get_n_links = &getNLinks;
+    iface.f_get_link = &getLink;
+    iface.f_get_link_at = &getLinkAt;
+}
+
+/// The surface's links, refreshed and parented so they are ready to
+/// hand to the bridge. A hyperlink whose AT context isn't realized yet
+/// has no bus name, and returning one crashes the client with a D-Bus
+/// assert.
+fn wiredLinks(hypertext: *a11y_hypertext.AccessibleHypertext) ?struct { *Surface, []Link } {
+    const surface = gobject.ext.cast(Surface, hypertext) orelse return null;
+    const self = surface.a11y();
+    _ = self.refreshCache(surface);
+    wireLinks(surface, self.links.items);
+    return .{ surface, self.links.items };
+}
+
+/// Parent each hyperlink to the surface, realizing its AT context. Must
+/// run outside `refreshCache`'s renderer mutex: realizing emits a tree
+/// change the client may answer by querying us, which would re-enter
+/// `refreshCache` and deadlock. Repeats are cheap; GTK skips a parent
+/// that is already set.
+fn wireLinks(surface: *Surface, links: []const Link) void {
+    const parent: *gtk.Accessible = surface.as(gtk.Accessible);
+    for (links) |link| {
+        const accessible: *gtk.Accessible = @ptrCast(@alignCast(link.obj));
+        accessible.setAccessibleParent(parent, null);
+    }
+}
+
+fn getNLinks(hypertext: *a11y_hypertext.AccessibleHypertext) callconv(.c) c_uint {
+    _, const links = wiredLinks(hypertext) orelse return 0;
+    return @intCast(links.len);
+}
+
+fn getLink(
+    hypertext: *a11y_hypertext.AccessibleHypertext,
+    index: c_uint,
+) callconv(.c) *a11y_hypertext.AccessibleHyperlink {
+    // Never fails for a real surface; the interface is only installed on
+    // one.
+    const surface, const links = wiredLinks(hypertext).?;
+
+    // The contract says `index` is below the link count; Orca breaks it
+    // when the link set shrinks between its `GetNLinks` and a queued
+    // `GetLink`. See `link_sentinel`.
+    if (index >= links.len) {
+        log.debug("ax GetLink({d}) out of bounds (links={d})", .{ index, links.len });
+        return linkSentinel(surface);
+    }
+    return links[index].obj;
+}
+
+/// The surface's sentinel hyperlink, created and parented on first use.
+/// Its bounds start at the maximum offset with zero length, past any
+/// real text, so Orca's range filter never matches it: with zero bounds
+/// it matched any zone starting at 0 and Orca announced a spurious
+/// "link" at the start of the line.
+fn linkSentinel(surface: *Surface) *a11y_hypertext.AccessibleHyperlink {
+    const self = surface.a11y();
+    if (self.link_sentinel) |s| return s;
+
+    var bounds: gtk.AccessibleTextRange = .{
+        .f_start = std.math.maxInt(c_uint),
+        .f_length = 0,
+    };
+    const obj = a11y_hypertext.hyperlinkNew(@ptrCast(surface), 0, "", &bounds);
+    const accessible: *gtk.Accessible = @ptrCast(@alignCast(obj));
+    accessible.setAccessibleParent(surface.as(gtk.Accessible), null);
+    self.link_sentinel = obj;
+    return obj;
+}
+
+fn getLinkAt(
+    hypertext: *a11y_hypertext.AccessibleHypertext,
+    offset: c_uint,
+) callconv(.c) c_uint {
+    _, const links = wiredLinks(hypertext) orelse return std.math.maxInt(c_uint);
+    for (links, 0..) |link, i| {
+        if (offset >= link.range.start and offset < link.range.end) return @intCast(i);
+    }
+    return std.math.maxInt(c_uint);
 }
