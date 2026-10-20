@@ -67,6 +67,10 @@ cache_stale: bool = false,
 /// not allocate once it has grown to viewport size.
 probe_buf: std.ArrayList(u8) = .empty,
 
+/// Non-default style runs over `cached_text`, rebuilt with it. Gaps
+/// between runs are default-styled.
+style_runs: std.ArrayList(StyleRun) = .empty,
+
 /// Links in `cached_text`, rebuilt with it. Only populated when
 /// `a11y_hypertext.available` (GTK >= 4.22). Each owns its URI and a
 /// strong reference on its hyperlink object.
@@ -110,6 +114,12 @@ pub const Link = struct {
     obj: *a11y_hypertext.AccessibleHyperlink,
 };
 
+/// A maximal run of codepoints sharing one non-default style.
+pub const StyleRun = struct {
+    range: Range,
+    style: terminal.Style,
+};
+
 /// Selection bounds in raw viewport cells, as the probe reads them.
 const SelRaw = struct {
     tl: terminal.point.Coordinate,
@@ -124,6 +134,7 @@ pub fn deinit(self: *A11y, alloc: Allocator) void {
     disposeLinksFrom(&self.links_prev, 0, alloc);
     self.links_prev.deinit(alloc);
     if (self.link_sentinel) |s| unparentAndUnref(s);
+    self.style_runs.deinit(alloc);
     self.probe_buf.deinit(alloc);
     self.cached_widths.deinit(alloc);
     if (self.cached_text) |v| alloc.free(v);
@@ -156,6 +167,8 @@ pub fn initAccessibleTextInterface(iface: *gtk.AccessibleTextInterface) callconv
     iface.f_get_contents_at = &getContentsAt;
     iface.f_get_caret_position = &getCaretPosition;
     iface.f_get_selection = &getSelection;
+    iface.f_get_attributes = &getAttributes;
+    iface.f_get_default_attributes = &getDefaultAttributes;
 
     // Later slots exist in our bindings, but `G_DEFINE_INTERFACE`
     // allocates the vtable at the *running* GTK's size, so on an older
@@ -313,6 +326,7 @@ fn refreshCache(self: *A11y, surface: *Surface) ?[:0]const u8 {
     self.links_prev = self.links;
     self.links = .empty;
     defer self.finalizeLinksPrev(alloc);
+    self.style_runs.clearRetainingCapacity();
 
     // Widths are rebuilt in lockstep with the text below; `build` only
     // appends, so the retained list must start empty to stay aligned
@@ -462,8 +476,14 @@ const Sink = struct {
         };
     }
 
-    /// Text attributes aren't exposed, so style runs are dropped.
-    pub fn commitStyleRun(_: *Sink, _: usize, _: usize, _: terminal.Style) void {}
+    /// Record a style run. Allocation failure drops it, which degrades
+    /// to "announced without attributes".
+    pub fn commitStyleRun(self: *Sink, start_cp: usize, end_cp: usize, style: terminal.Style) void {
+        self.a11y.style_runs.append(self.alloc, .{
+            .range = .{ .start = @intCast(start_cp), .end = @intCast(end_cp) },
+            .style = style,
+        }) catch {};
+    }
 
     pub fn committedLinkCount(self: *Sink) usize {
         return self.a11y.links.items.len;
@@ -1030,6 +1050,180 @@ fn setSelection(
     // Paint the highlight.
     surface.redraw();
     return 1;
+}
+
+/// The most attributes `getAttributes` reports for one run.
+const max_attributes = 16;
+
+/// Report the SGR attributes of the style run containing `offset`, with
+/// the run's whole range so clients don't re-query once per character.
+/// Ownership follows `get_default_attributes`: `ranges` is
+/// transfer-container (`g_free`), the name and value arrays are
+/// NULL-terminated and freed with `g_strfreev`.
+///
+/// Standard AT-SPI attribute names where one exists; terminal-only ones
+/// get a `ghostty-` prefix so clients that don't know them won't read
+/// them as standard attributes.
+fn getAttributes(
+    accessible: *gtk.AccessibleText,
+    offset: c_uint,
+    n_ranges: *usize,
+    out_ranges: ?*[*]gtk.AccessibleTextRange,
+    out_names: ?*[*][*:0]u8,
+    out_values: ?*[*][*:0]u8,
+) callconv(.c) c_int {
+    n_ranges.* = 0;
+    const surface = gobject.ext.cast(Surface, accessible) orelse return 0;
+    const self = surface.a11y();
+    const core_surface = surface.core() orelse return 0;
+
+    _ = self.refreshCache(surface) orelse return 0;
+
+    const run: StyleRun = for (self.style_runs.items) |r| {
+        if (offset >= r.range.start and offset < r.range.end) break r;
+    } else return 0;
+
+    // Resolve palette colors to the RGB the user sees. The palette can
+    // change under OSC 4, so read it under the renderer mutex.
+    const Colors = struct {
+        fg: ?terminal.color.RGB,
+        bg: ?terminal.color.RGB,
+        underline: ?terminal.color.RGB,
+    };
+    const colors: Colors = colors: {
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+        const palette = &core_surface.renderer_state.terminal.colors.palette.current;
+        break :colors .{
+            .fg = resolveColor(run.style.fg_color, palette),
+            .bg = resolveColor(run.style.bg_color, palette),
+            .underline = resolveColor(run.style.underline_color, palette),
+        };
+    };
+
+    var attrs: Attributes = .{};
+    if (colors.fg) |rgb| attrs.addColor("fg-color", rgb);
+    if (colors.bg) |rgb| attrs.addColor("bg-color", rgb);
+
+    const flags = run.style.flags;
+    // Faint reports as a light weight so clients that key on "weight"
+    // still see it; `ghostty-faint` below keeps it distinct from a
+    // configured light font.
+    if (flags.bold) attrs.add("weight", "700") else if (flags.faint) attrs.add("weight", "300");
+    if (flags.italic) attrs.add("style", "italic");
+    switch (flags.underline) {
+        .none => {},
+        // AT-SPI only knows none/single/double/error.
+        .single, .curly, .dotted, .dashed => attrs.add("underline", "single"),
+        .double => attrs.add("underline", "double"),
+    }
+    if (flags.overline) attrs.add("overline", "single");
+    if (flags.strikethrough) attrs.add("strikethrough", "true");
+    if (flags.faint) attrs.add("ghostty-faint", "true");
+    if (flags.blink) attrs.add("ghostty-blink", "true");
+    if (flags.inverse) attrs.add("ghostty-inverse", "true");
+    if (flags.invisible) attrs.add("ghostty-invisible", "true");
+    if (colors.underline) |rgb| attrs.addColor("ghostty-underline-color", rgb);
+
+    if (attrs.count == 0) return 0;
+
+    if (out_ranges) |out| {
+        const ranges: [*]gtk.AccessibleTextRange = @ptrCast(@alignCast(
+            glib.malloc(@sizeOf(gtk.AccessibleTextRange)),
+        ));
+        ranges[0] = .{
+            .f_start = run.range.start,
+            .f_length = run.range.end - run.range.start,
+        };
+        out.* = ranges;
+    }
+    attrs.transfer(out_names, out_values);
+    n_ranges.* = 1;
+    return 1;
+}
+
+fn resolveColor(
+    color: terminal.Style.Color,
+    palette: *const terminal.color.Palette,
+) ?terminal.color.RGB {
+    return switch (color) {
+        .none => null,
+        .palette => |idx| palette[idx],
+        .rgb => |rgb| rgb,
+    };
+}
+
+/// Attribute name/value pairs being collected for a GTK caller, as
+/// `g_strdup`'d strings it will own.
+const Attributes = struct {
+    names: [max_attributes][*:0]u8 = undefined,
+    values: [max_attributes][*:0]u8 = undefined,
+    count: usize = 0,
+
+    fn add(self: *Attributes, name: [*:0]const u8, value: [*:0]const u8) void {
+        assert(self.count < max_attributes);
+        self.names[self.count] = glib.strdup(name);
+        self.values[self.count] = glib.strdup(value);
+        self.count += 1;
+    }
+
+    fn addColor(self: *Attributes, name: [*:0]const u8, rgb: terminal.color.RGB) void {
+        var buf: [16]u8 = undefined;
+        // Three u8 and two commas always fit.
+        const value = std.mem.printSentinel(&buf, "{d},{d},{d}", .{ rgb.r, rgb.g, rgb.b }, 0) catch
+            unreachable;
+        self.add(name, value.ptr);
+    }
+
+    /// Hand the strings to the caller as two NULL-terminated arrays, or
+    /// free those it declined.
+    fn transfer(self: *Attributes, out_names: ?*[*][*:0]u8, out_values: ?*[*][*:0]u8) void {
+        giveStrv(self.names[0..self.count], out_names);
+        giveStrv(self.values[0..self.count], out_values);
+    }
+
+    fn giveStrv(strs: [][*:0]u8, out: ?*[*][*:0]u8) void {
+        const dest = out orelse {
+            for (strs) |s| glib.free(s);
+            return;
+        };
+        // `g_malloc0` leaves the trailing NULL slot zeroed.
+        const arr: [*][*:0]u8 = @ptrCast(@alignCast(
+            glib.malloc0((strs.len + 1) * @sizeOf(?[*:0]u8)),
+        ));
+        @memcpy(arr[0..strs.len], strs);
+        dest.* = arr;
+    }
+};
+
+/// Report the font every cell is drawn in: the first configured family
+/// and the live size in points, so increase/decrease/reset_font_size
+/// show up as the user sees them.
+fn getDefaultAttributes(
+    accessible: *gtk.AccessibleText,
+    out_names: ?*[*][*:0]u8,
+    out_values: ?*[*][*:0]u8,
+) callconv(.c) void {
+    var attrs: Attributes = .{};
+    // Without a core surface the arrays are empty but still present, so
+    // GTK's `g_strfreev` has something valid to free.
+    defer attrs.transfer(out_names, out_values);
+
+    const surface = gobject.ext.cast(Surface, accessible) orelse return;
+    const core_surface = surface.core() orelse return;
+
+    // An empty list falls back to "monospace", like the font backend.
+    const families = core_surface.config.font.@"font-family".list.items;
+    attrs.add("family-name", if (families.len > 0) families[0].ptr else "monospace");
+
+    var buf: [32]u8 = undefined;
+    const size: [:0]const u8 = std.mem.printSentinel(
+        &buf,
+        "{d:.2}",
+        .{core_surface.font_size.points},
+        0,
+    ) catch "0";
+    attrs.add("size", size.ptr);
 }
 
 //---------------------------------------------------------------
