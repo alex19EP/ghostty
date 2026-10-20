@@ -50,6 +50,15 @@ last_snapshot: ?[:0]const u8 = null,
 /// Caret offset at the last caret notification.
 last_notified_caret: c_uint = 0,
 
+/// The selection at the last selection notification, in codepoints of
+/// the text it was notified against. Null when there was none.
+last_selection: ?Range = null,
+
+/// Raw viewport bounds of the selection seen by the last probe: the
+/// probe's edge detector, kept apart from `last_selection` so an
+/// unchanged frame never converts offsets.
+last_sel_raw: ?SelRaw = null,
+
 /// Set on every rendered frame; cleared when the cache is confirmed
 /// to still match the viewport.
 cache_stale: bool = false,
@@ -101,6 +110,12 @@ pub const Link = struct {
     obj: *a11y_hypertext.AccessibleHyperlink,
 };
 
+/// Selection bounds in raw viewport cells, as the probe reads them.
+const SelRaw = struct {
+    tl: terminal.point.Coordinate,
+    br: terminal.point.Coordinate,
+};
+
 pub fn deinit(self: *A11y, alloc: Allocator) void {
     // `links_prev` is empty outside a refresh, but drain it anyway in case
     // a refresh was interrupted.
@@ -140,6 +155,7 @@ pub fn initAccessibleTextInterface(iface: *gtk.AccessibleTextInterface) callconv
     iface.f_get_contents = &getContents;
     iface.f_get_contents_at = &getContentsAt;
     iface.f_get_caret_position = &getCaretPosition;
+    iface.f_get_selection = &getSelection;
 
     // Later slots exist in our bindings, but `G_DEFINE_INTERFACE`
     // allocates the vtable at the *running* GTK's size, so on an older
@@ -148,6 +164,10 @@ pub fn initAccessibleTextInterface(iface: *gtk.AccessibleTextInterface) callconv
     if (gtk_version.runtimeAtLeast(4, 16, 0)) {
         iface.f_get_extents = &getExtents;
         iface.f_get_offset = &getOffset;
+    }
+    if (gtk_version.runtimeAtLeast(4, 22, 0)) {
+        iface.f_set_caret_position = &setCaretPosition;
+        iface.f_set_selection = &setSelection;
     }
 }
 
@@ -499,7 +519,8 @@ fn finalizeLinksPrev(self: *A11y, alloc: Allocator) void {
 
 /// Cheap per-frame check for "could anything an AT client cares about
 /// have changed?": build only the text into the retained scratch
-/// buffer and compare it and the caret against the last notification.
+/// buffer and compare it, the caret and the raw selection bounds against
+/// the last notification.
 /// Conservative: may answer true on a frame the full path then finds
 /// nothing to emit for, never false when something moved.
 fn probeChanged(self: *A11y, surface: *Surface) bool {
@@ -518,12 +539,15 @@ fn probeChanged(self: *A11y, surface: *Surface) bool {
     var probe: std.Io.Writer.Allocating = .fromArrayList(alloc, &self.probe_buf);
     defer self.probe_buf = probe.toArrayList();
 
+    var sel_raw: ?SelRaw = null;
     const result = result: {
         core_surface.renderer_state.mutex.lockUncancelable(global.io());
         defer core_surface.renderer_state.mutex.unlock(global.io());
 
         const screen: *terminal.Screen =
             core_surface.renderer_state.terminal.screens.active;
+
+        sel_raw = selectionRaw(screen);
 
         break :result a11y.text.build(
             &probe.writer,
@@ -537,8 +561,14 @@ fn probeChanged(self: *A11y, surface: *Surface) bool {
         };
     };
 
+    // Edge-detect the selection: record this frame's reading whatever
+    // we return, so a change is reported exactly once.
+    const selection_moved = !std.meta.eql(self.last_sel_raw, sel_raw);
+    self.last_sel_raw = sel_raw;
+
     const text = probe.written();
     if (!std.mem.eql(u8, old_text, text)) return true;
+    if (selection_moved) return true;
 
     // Text is identical, so the caret's byte offset converts against
     // the same bytes the cache was built from.
@@ -547,12 +577,45 @@ fn probeChanged(self: *A11y, surface: *Surface) bool {
     return caret_cp != self.last_notified_caret;
 }
 
-/// Emit AT-SPI change events if the viewport text or caret moved since
-/// the last notification. We diff against the last notified snapshot
-/// and emit the smallest remove/insert pair: firing unconditionally
-/// would make an AT client restart reading on every rendered frame,
-/// and Orca's terminal script classifies events by `any_data` length,
-/// so a one-character insert reads as typing echo, not command output.
+/// The selection's bounds in viewport cells, or null if there is none
+/// or either end is outside the viewport. Caller holds the renderer
+/// mutex.
+fn selectionRaw(screen: *terminal.Screen) ?SelRaw {
+    const sel = screen.selection orelse return null;
+    const tl = screen.pages.pointFromPin(.viewport, sel.topLeft(screen)) orelse return null;
+    const br = screen.pages.pointFromPin(.viewport, sel.bottomRight(screen)) orelse return null;
+    return .{ .tl = tl.viewport, .br = br.viewport };
+}
+
+/// The terminal selection as a codepoint range of `text`, which must be
+/// the current `cached_text`. Null when there is no selection or it
+/// can't be represented: the snapshot is viewport-only, so a selection
+/// with an end in the scrollback has no offsets to report.
+fn selectionRange(self: *A11y, surface: *Surface, text: []const u8) ?Range {
+    const core_surface = surface.core() orelse return null;
+    const raw = raw: {
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+        break :raw selectionRaw(core_surface.renderer_state.terminal.screens.active);
+    } orelse return null;
+
+    const widths = self.cellWidths();
+    const start = a11y.offsets.rowColToCp(text, widths, raw.tl.y, raw.tl.x) orelse
+        return null;
+    // The selection's end cell is inclusive; the range is not.
+    const end = (a11y.offsets.rowColToCp(text, widths, raw.br.y, raw.br.x) orelse
+        return null) + 1;
+    if (end <= start) return null;
+    return .{ .start = @intCast(start), .end = @intCast(end) };
+}
+
+/// Emit AT-SPI change events if the viewport text, caret or selection
+/// moved since the last notification. We diff against the last notified
+/// snapshot and emit the smallest remove/insert pair: firing
+/// unconditionally would make an AT client restart reading on every
+/// rendered frame, and Orca's terminal script classifies events by
+/// `any_data` length, so a one-character insert reads as typing echo,
+/// not command output.
 fn notifyIfChanged(self: *A11y, surface: *Surface) void {
     const alloc = Application.default().allocator();
 
@@ -575,9 +638,12 @@ fn notifyIfChanged(self: *A11y, surface: *Surface) void {
 
     const text_changed = !std.mem.eql(u8, old_text, new_text);
     const caret_changed = self.cached_cursor_offset != self.last_notified_caret;
+    const selection = self.selectionRange(surface, new_text);
+    const selection_changed = !std.meta.eql(selection, self.last_selection);
 
-    if (!text_changed and !caret_changed) return;
+    if (!text_changed and !caret_changed and !selection_changed) return;
 
+    const accessible = surface.as(gtk.AccessibleText);
     if (text_changed) {
         self.emitTextDiff(surface, old_text, new_text);
 
@@ -588,7 +654,11 @@ fn notifyIfChanged(self: *A11y, surface: *Surface) void {
     }
     if (caret_changed) {
         self.last_notified_caret = self.cached_cursor_offset;
-        gtk.AccessibleText.updateCaretPosition(surface.as(gtk.AccessibleText));
+        gtk.AccessibleText.updateCaretPosition(accessible);
+    }
+    if (selection_changed) {
+        self.last_selection = selection;
+        gtk.AccessibleText.updateSelectionBound(accessible);
     }
 }
 
@@ -825,6 +895,141 @@ fn getCaretPosition(
     const self = surface.a11y();
     _ = self.refreshCache(surface);
     return self.cached_cursor_offset;
+}
+
+/// Move the caret to `offset` (GTK 4.22+). A terminal has no caret an
+/// AT client can set directly, since the shell owns the cursor, so this
+/// clicks the cell at `offset`. With shell integration that click moves
+/// the prompt cursor (`Surface.maybePromptClick`); elsewhere it is a
+/// benign click that selects nothing. This is what braille cursor
+/// routing keys arrive as.
+fn setCaretPosition(
+    accessible: *gtk.AccessibleText,
+    offset: c_uint,
+) callconv(.c) c_int {
+    const surface = gobject.ext.cast(Surface, accessible) orelse return 0;
+    const self = surface.a11y();
+    const core_surface = surface.core() orelse return 0;
+
+    const text = self.refreshCache(surface) orelse return 0;
+
+    // Clamp to the last codepoint rather than past-the-end so the cell
+    // lookup below always lands on a real cell.
+    const text_cp_count = utf8CpCount(text);
+    const off_cp: usize = if (text_cp_count == 0) 0 else @min(offset, text_cp_count - 1);
+
+    // A codepoint offset is not a column: a double-width character earlier
+    // on the row takes two, and clicking as though it took one lands on
+    // the wrong word.
+    const cell = a11y.offsets.cpToGrid(text, self.cellWidths(), off_cp);
+
+    const cell_w: f32 = @floatFromInt(core_surface.size.cell.width);
+    const cell_h: f32 = @floatFromInt(core_surface.size.cell.height);
+    if (cell_w <= 0 or cell_h <= 0) return 0;
+
+    // The cell's center, in the device pixels the core's mouse handling
+    // works in (no widget scale here), past the renderer's padding gutter.
+    // Without the gutter the click lands in the padding, and nvim, like
+    // any mouse-reporting program, silently ignores it.
+    const pad_left: f32 = @floatFromInt(core_surface.size.padding.left);
+    const pad_top: f32 = @floatFromInt(core_surface.size.padding.top);
+    surface.synthesizeClick(.{
+        .x = pad_left + @as(f32, @floatFromInt(cell.col)) * cell_w + cell_w / 2.0,
+        .y = pad_top + @as(f32, @floatFromInt(cell.row)) * cell_h + cell_h / 2.0,
+    }) catch |err| {
+        log.warn("ax set caret position click failed err={}", .{err});
+        return 0;
+    };
+    return 1;
+}
+
+/// Report the terminal's selection, if any, as one range. See
+/// `selectionRange` for when one can't be reported.
+fn getSelection(
+    accessible: *gtk.AccessibleText,
+    n_ranges: *usize,
+    out_ranges: ?*[*]gtk.AccessibleTextRange,
+) callconv(.c) c_int {
+    n_ranges.* = 0;
+    const surface = gobject.ext.cast(Surface, accessible) orelse return 0;
+    const self = surface.a11y();
+    const text = self.refreshCache(surface) orelse return 0;
+    const range = self.selectionRange(surface, text) orelse return 0;
+
+    // Transfer-container: the caller frees the array with `g_free`.
+    if (out_ranges) |out| {
+        const ranges: [*]gtk.AccessibleTextRange = @ptrCast(@alignCast(
+            glib.malloc(@sizeOf(gtk.AccessibleTextRange)),
+        ));
+        ranges[0] = .{ .f_start = range.start, .f_length = range.end - range.start };
+        out.* = ranges;
+    }
+    n_ranges.* = 1;
+    return 1;
+}
+
+/// Select a codepoint range of the snapshot (GTK 4.22+); an empty range
+/// clears the selection. Only selection 0 exists.
+fn setSelection(
+    accessible: *gtk.AccessibleText,
+    i: usize,
+    range: *gtk.AccessibleTextRange,
+) callconv(.c) c_int {
+    if (i != 0) return 0;
+
+    const surface = gobject.ext.cast(Surface, accessible) orelse return 0;
+    const self = surface.a11y();
+    const core_surface = surface.core() orelse return 0;
+
+    const text = self.refreshCache(surface) orelse return 0;
+    const text_cp_count = utf8CpCount(text);
+
+    if (range.f_length == 0) {
+        {
+            core_surface.renderer_state.mutex.lockUncancelable(global.io());
+            defer core_surface.renderer_state.mutex.unlock(global.io());
+            core_surface.renderer_state.terminal.screens.active.clearSelection();
+        }
+        surface.redraw();
+        return 1;
+    }
+
+    // The range comes from another process, so saturate rather than wrap.
+    const start_cp = @min(range.f_start, text_cp_count);
+    const end_cp = @min(std.math.add(usize, range.f_start, range.f_length) catch
+        text_cp_count, text_cp_count);
+    if (end_cp <= start_cp) return 0;
+
+    // The selection's end cell is inclusive; the range is not.
+    const widths = self.cellWidths();
+    const start = a11y.offsets.cpToGrid(text, widths, start_cp);
+    const end = a11y.offsets.cpToGrid(text, widths, end_cp - 1);
+
+    {
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+
+        const screen: *terminal.Screen = core_surface.renderer_state.terminal.screens.active;
+        if (screen.pages.cols == 0) return 0;
+        const max_col = screen.pages.cols - 1;
+        const start_pin = screen.pages.pin(.{ .viewport = .{
+            .x = @intCast(@min(start.col, max_col)),
+            .y = start.row,
+        } }) orelse return 0;
+        const end_pin = screen.pages.pin(.{ .viewport = .{
+            .x = @intCast(@min(end.col, max_col)),
+            .y = end.row,
+        } }) orelse return 0;
+
+        screen.select(terminal.Selection.init(start_pin, end_pin, false)) catch |err| {
+            log.warn("ax set selection failed err={}", .{err});
+            return 0;
+        };
+    }
+
+    // Paint the highlight.
+    surface.redraw();
+    return 1;
 }
 
 //---------------------------------------------------------------

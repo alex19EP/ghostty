@@ -804,6 +804,26 @@ pub const Surface = extern struct {
         return &self.private().a11y;
     }
 
+    /// Click the left button at `pos`, in the device pixels the core
+    /// surface's mouse handling uses, on behalf of an assistive technology
+    /// moving the caret. The pointer position is restored afterwards.
+    pub fn synthesizeClick(self: *Self, pos: apprt.CursorPos) !void {
+        const priv = self.private();
+        const core_surface = priv.core_surface orelse return;
+
+        // The core asks us for the cursor position (`getCursorPos`) rather
+        // than trusting what it was last told, so set ours too, as
+        // `ecMouseMotion` does. Otherwise the click lands wherever the
+        // physical pointer is.
+        const saved = priv.cursor_pos;
+        priv.cursor_pos = pos;
+        defer priv.cursor_pos = saved;
+
+        try core_surface.cursorPosCallback(pos, null);
+        _ = try core_surface.mouseButtonCallback(.press, .left, .{});
+        _ = try core_surface.mouseButtonCallback(.release, .left, .{});
+    }
+
     pub fn rt(self: *Self) *ApprtSurface {
         const priv = self.private();
         return &priv.rt_surface;
