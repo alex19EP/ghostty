@@ -293,7 +293,9 @@ pub fn buildWithSink(
             // flush or end-of-row.
             if (is_cursor_row and col == row_cursor_x) {
                 if (cell.hasText()) {
-                    cursor_byte = snap.end();
+                    // Any pending blanks are flushed as one-byte spaces
+                    // before this cell is written, so it lands past them.
+                    cursor_byte = snap.end() + blank_cells;
                 } else {
                     cursor_blank_idx = blank_cells;
                 }
@@ -658,6 +660,28 @@ test "a11y text: cursor inside an interior blank run lands on its column" {
     // Byte 3 is the second of the four spaces, the cell the cursor is
     // on, not the start or the end of the run.
     try testing.expectEqual(3, result.cursor_byte.?);
+}
+
+test "a11y text: cursor on text after an interior blank run" {
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 10, .rows = 1 });
+    defer t.deinit(alloc);
+
+    try t.printString("ab");
+    t.setCursorPos(1, 6);
+    try t.printString("cd");
+    // Park the cursor on 'c', right after the never-written gap. That gap
+    // is still pending when the walk reaches 'c', so a cursor recorded
+    // without it lands at the start of the gap instead.
+    t.setCursorPos(1, 6);
+
+    var buffer: std.Io.Writer.Allocating = .init(alloc);
+    defer buffer.deinit();
+
+    const result = try build(&buffer.writer, t.screens.active, .{});
+
+    try testing.expectEqualStrings("ab   cd", buffer.written());
+    try testing.expectEqual(5, result.cursor_byte.?);
 }
 
 test "a11y text: caret mode reports the caret, not the terminal cursor" {
