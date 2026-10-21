@@ -49,6 +49,11 @@ safe because it lives on separate buses.
 **Never pass `--replace`.** That SIGKILLs every Orca of your uid,
 including the one you are using.
 
+BrlAPI's sockets don't follow `XDG_RUNTIME_DIR`, so `run.sh` points
+`BRLAPI_HOST` at a socket that doesn't exist. Otherwise the private Orca
+connects to your own brltty and writes to your braille display. Braille
+stays enabled, as it is by default, but has no display.
+
 Orca gets keys from Mutter's `org.freedesktop.a11y.KeyboardMonitor`, as on
 GNOME Wayland:
 - **Under Xvfb,** where nothing provides it, `driver.py` registers a fake
