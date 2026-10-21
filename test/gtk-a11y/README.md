@@ -74,6 +74,9 @@ own config is not read.
 Each test module gets its own Ghostty instance, because `test_events.py` types
 into the terminal and would otherwise leak state into the others.
 
+`perf/` is not part of the suite. It measures what a terminal costs a real
+Orca, against kgx; see `perf/README.md`.
+
 ## Writing tests
 
 Assert what an assistive technology can observe, and say in the docstring which
