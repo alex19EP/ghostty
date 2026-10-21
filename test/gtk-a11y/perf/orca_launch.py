@@ -28,4 +28,39 @@ launcher.other_orcas = lambda: []
 import orca  # noqa: E402
 
 print(f"orca package: {orca.__file__}", flush=True)
+
+# ORCA_NO_BRAILLE=1: braille/enabled = false in the default profile. Orca has
+# no command line switch for it, and run.sh's memory GSettings backend lives
+# in this process, so it has to be set here before Orca reads it.
+if os.environ.get("ORCA_NO_BRAILLE"):
+    from gi.repository import Gio  # noqa: E402
+
+    Gio.Settings.new_with_path("org.gnome.Orca.Braille", "/org/gnome/orca/default/braille/").set_boolean(
+        "enabled", False
+    )
+    print("braille disabled", flush=True)
+
+# ORCA_LINK_STACKS=1: write the Python stack of every call to Orca's
+# link-walking helpers into its debug log (--orca-debug), as "LINK STACK:".
+if os.environ.get("ORCA_LINK_STACKS"):
+    import traceback  # noqa: E402
+
+    from orca import debug  # noqa: E402
+    from orca.ax_utilities import AXUtilities  # noqa: E402
+    from orca.ax_utilities_hypertext import AXUtilitiesHypertext  # noqa: E402
+
+    def _traced(name, func):
+        def wrapper(*args, **kwargs):
+            stack = "".join(traceback.format_stack()[:-1])
+            debug.print_message(debug.LEVEL_INFO, f"LINK STACK: {name}\n{stack}", True)
+            return func(*args, **kwargs)
+
+        return staticmethod(wrapper)
+
+    # AXUtilities copies the helpers at import time, so patch both classes.
+    for name in ("get_all_links_in_range", "get_all_links"):
+        traced = _traced(name, getattr(AXUtilitiesHypertext, name))
+        setattr(AXUtilitiesHypertext, name, traced)
+        setattr(AXUtilities, name, traced)
+
 sys.exit(launcher.main())
