@@ -68,6 +68,7 @@ own config is not read.
 | `test_first_event.py` | The first change event after a client starts reading is a diff, not the whole viewport again. Listens from before launch. |
 | `test_selection.py` | Selection once output has scrolled off, and the NULL-`ranges` path GTK's AddSelection takes. Its pty prints 200 lines. |
 | `test_click.py` | Braille cursor routing: that the synthetic click lands on the routed-to cell. Its pty has mouse reporting on. |
+| `test_mouse.py` | Real pointer input through XTEST: click and wheel reports, drag and double-click selection with middle-click paste, the context menu and search handing focus back, click-to-focus and focus-follows-mouse in splits, and split geometry plus braille routing in each split. Runs several Ghosttys, some with splits. |
 | `test_title_label.py` | The header bar title label survives extents queries while its text churns — a GTK `GtkLabel` NULL-layout crash Ghostty works around. Its pty storms the title; it turns the header bar on. |
 
 Each test module gets its own Ghostty instance, because `test_events.py` types
