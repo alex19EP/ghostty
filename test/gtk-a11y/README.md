@@ -63,7 +63,7 @@ own config is not read.
 | `conftest.py` | The `session` fixture (one Ghostty per test module) and the `launch` factory behind it. |
 | `test_tree.py` | Roles, application name, and the shape of the accessible tree. |
 | `test_text.py` | `GtkAccessibleText`: contents, codepoint offsets, extents, attributes. |
-| `test_hypertext.py` | OSC 8 and regex links, and the out-of-bounds sentinel. |
+| `test_hypertext.py` | OSC 8 and regex links, link indices in text order on a screen that mixes both, and the out-of-bounds sentinel. |
 | `test_events.py` | Change events, the caret, and selection — needs a live pty. |
 | `test_first_event.py` | The first change event after a client starts reading is a diff, not the whole viewport again. Listens from before launch. |
 | `test_selection.py` | Selection once output has scrolled off, and the NULL-`ranges` path GTK's AddSelection takes. Its pty prints 200 lines. |
