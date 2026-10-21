@@ -737,6 +737,12 @@ pub const Surface = extern struct {
         vscroll_policy: gtk.ScrollablePolicy = .natural,
         vadj_signal_group: ?*gobject.SignalGroup = null,
 
+        // The latest scrollbar state from the renderer that hasn't been
+        // applied to vadj yet, and the tick callback that will apply it.
+        // See setScrollbar.
+        scrollbar_pending: ?terminal.Scrollbar = null,
+        scrollbar_tick_id: c_uint = 0,
+
         // Key state tracking for key sequences and tables
         key_sequence: std.ArrayListUnmanaged([:0]const u8) = .empty,
         key_tables: std.ArrayListUnmanaged([:0]const u8) = .empty,
@@ -1065,7 +1071,42 @@ pub const Surface = extern struct {
 
     /// Set the scrollbar state for this surface. This will setup the
     /// properties for our Gtk.Scrollable interface properly.
+    ///
+    /// The renderer sends this on every frame it draws, which can be many
+    /// times per displayed frame under heavy output. Each adjustment
+    /// change is also an AT-SPI `accessible-value` event that screen
+    /// readers have to process, so only the latest state is applied, once
+    /// per frame clock tick. A position nobody could see is never sent.
     pub fn setScrollbar(self: *Self, scrollbar: terminal.Scrollbar) void {
+        const priv = self.private();
+        priv.scrollbar_pending = scrollbar;
+        if (priv.scrollbar_tick_id != 0) return;
+        priv.scrollbar_tick_id = self.as(gtk.Widget).addTickCallback(
+            scrollbarTick,
+            null,
+            null,
+        );
+    }
+
+    fn scrollbarTick(
+        widget: *gtk.Widget,
+        _: *gdk.FrameClock,
+        _: ?*anyopaque,
+    ) callconv(.c) c_int {
+        const self: *Self = gobject.ext.cast(Self, widget) orelse return 0;
+        const priv = self.private();
+        priv.scrollbar_tick_id = 0;
+        if (priv.scrollbar_pending) |scrollbar| {
+            priv.scrollbar_pending = null;
+            self.applyScrollbar(scrollbar);
+        }
+
+        // G_SOURCE_REMOVE: setScrollbar adds the callback again when
+        // there is a new state to apply.
+        return 0;
+    }
+
+    fn applyScrollbar(self: *Self, scrollbar: terminal.Scrollbar) void {
         // Update existing adjustment in-place. If we don't have an
         // adjustment then we do nothing because we're not part of a
         // scrolled window.
@@ -1085,8 +1126,7 @@ pub const Surface = extern struct {
 
         // If we have a vadjustment we MUST have the signal group since
         // it is setup in the prop handler.
-        const priv = self.private();
-        const group = priv.vadj_signal_group.?;
+        const group = self.private().vadj_signal_group.?;
 
         // During manual scrollbar changes from Ghostty core we don't
         // want to emit value-changed signals so we block them. This would
@@ -1951,6 +1991,11 @@ pub const Surface = extern struct {
             binding.unbind();
             binding.unref();
             priv.is_split_binding = null;
+        }
+
+        if (priv.scrollbar_tick_id != 0) {
+            self.as(gtk.Widget).removeTickCallback(priv.scrollbar_tick_id);
+            priv.scrollbar_tick_id = 0;
         }
 
         if (priv.vadj_signal_group) |group| {
