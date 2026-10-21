@@ -343,6 +343,7 @@ fn refreshCache(self: *A11y, surface: *Surface) ?[:0]const u8 {
     // look them up.
     const track_links = a11y_hypertext.available;
     var sink: Sink = .{ .a11y = self, .surface = surface, .alloc = alloc };
+    defer sink.deinit();
 
     // The renderer mutex covers only the walk; everything after this
     // point reads `buffer`, which is our own memory.
@@ -380,6 +381,7 @@ fn refreshCache(self: *A11y, surface: *Surface) ?[:0]const u8 {
         core_surface.config.links,
         &sink,
     );
+    sink.finishLinks();
 
     const text = alloc.dupeSentinel(u8, buffer.written(), 0) catch return null;
     self.cached_text = text;
@@ -403,35 +405,90 @@ fn refreshCache(self: *A11y, surface: *Surface) ?[:0]const u8 {
 }
 
 /// The sink `a11y.text.buildWithSink` and `matchRegexLinks` report into
-/// during a `refreshCache`. It runs under the renderer mutex, so it
-/// must not do anything that can call back into us; see `commitLink`.
+/// during a `refreshCache`. The walk half runs under the renderer mutex,
+/// so it must not do anything that can call back into us; see
+/// `commitLink`.
 const Sink = struct {
     a11y: *A11y,
     surface: *Surface,
     alloc: Allocator,
 
-    /// Record a link range. When the previous refresh had an identical
-    /// link at the same index its hyperlink object is moved over as is,
-    /// keeping its AT-SPI bus path alive across the frame. Reuse is by
-    /// index because a hyperlink's index is construct-only. Allocation
-    /// failure drops the link, which degrades to plain text.
+    /// Links found so far, in discovery order: the walk's OSC 8 runs,
+    /// then the regex matches. `finishLinks` turns them into `A11y.links`
+    /// in offset order.
+    pending: std.ArrayList(Pending) = .empty,
+
+    const Pending = struct {
+        range: Range,
+        uri: [:0]u8,
+    };
+
+    /// Record a link range. Only copies it: the hyperlink objects are made
+    /// in `finishLinks`, once every link is known, because their indices
+    /// have to follow text order. Allocation failure drops the link, which
+    /// degrades to plain text.
     pub fn commitLink(self: *Sink, start_cp: usize, end_cp: usize, uri: []const u8) void {
         if (start_cp >= end_cp) return;
 
+        const uri_owned = self.alloc.dupeSentinel(u8, uri, 0) catch |err| {
+            log.warn("ax link uri dup failed: {}", .{err});
+            return;
+        };
+        self.pending.append(self.alloc, .{
+            .range = .{ .start = @intCast(start_cp), .end = @intCast(end_cp) },
+            .uri = uri_owned,
+        }) catch |err| {
+            log.warn("ax link append failed: {}", .{err});
+            self.alloc.free(uri_owned);
+        };
+    }
+
+    /// Sort the pending links by start offset and give each its hyperlink
+    /// object, so link index order is text order. The walk commits OSC 8
+    /// links before the regex pass adds its matches, and each configured
+    /// regex adds its own sorted run, so discovery order is not text
+    /// order once a screen mixes them. Orca relies on text order to find
+    /// the links in a range without reading every link's offsets, one
+    /// D-Bus round trip each, on every spoken insertion. The sort is
+    /// stable, so links starting at the same offset keep discovery order.
+    fn finishLinks(self: *Sink) void {
+        std.mem.sort(Pending, self.pending.items, {}, struct {
+            fn lessThan(_: void, a: Pending, b: Pending) bool {
+                return a.range.start < b.range.start;
+            }
+        }.lessThan);
+        for (self.pending.items) |link| self.adoptLink(link);
+        // Every entry's URI now belongs to `A11y.links` or was freed.
+        self.pending.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *Sink) void {
+        for (self.pending.items) |link| self.alloc.free(link.uri);
+        self.pending.deinit(self.alloc);
+    }
+
+    /// Append `link` to `A11y.links`, taking ownership of its URI. When the
+    /// previous refresh had an identical link at the same index its
+    /// hyperlink object is moved over as is, keeping its AT-SPI bus path
+    /// alive across the frame. Reuse is by index because a hyperlink's
+    /// index is construct-only.
+    fn adoptLink(self: *Sink, link: Pending) void {
         const state = self.a11y;
-        const range: Range = .{ .start = @intCast(start_cp), .end = @intCast(end_cp) };
+        const range = link.range;
+        const uri_owned = link.uri;
         const target_idx = state.links.items.len;
 
         if (!state.links_prev_frozen and target_idx < state.links_prev.items.len) reuse: {
             const candidate = state.links_prev.items[target_idx];
             if (std.meta.eql(candidate.range, range) and
-                std.mem.eql(u8, candidate.uri, uri))
+                std.mem.eql(u8, candidate.uri, uri_owned))
             {
                 state.links.append(self.alloc, candidate) catch |err| {
                     log.warn("ax link append failed: {}", .{err});
                     break :reuse;
                 };
                 state.links_prev_consumed = target_idx + 1;
+                self.alloc.free(uri_owned);
                 return;
             }
 
@@ -444,11 +501,6 @@ const Sink = struct {
             disposeLinksFrom(&state.links_prev, state.links_prev_consumed, self.alloc);
         }
 
-        const uri_owned = self.alloc.dupeSentinel(u8, uri, 0) catch |err| {
-            log.warn("ax link uri dup failed: {}", .{err});
-            return;
-        };
-
         var bounds: gtk.AccessibleTextRange = .{
             .f_start = range.start,
             .f_length = range.end - range.start,
@@ -456,7 +508,7 @@ const Sink = struct {
 
         // Not parented here: setting the parent realizes the hyperlink's
         // AT context, which can make the client query us back, re-entering
-        // `refreshCache` and deadlocking on the renderer mutex we're under.
+        // `refreshCache` while this one is still building the cache.
         // `wireLinks` parents them afterwards.
         const obj = a11y_hypertext.hyperlinkNew(
             @ptrCast(self.surface),
@@ -486,14 +538,14 @@ const Sink = struct {
     }
 
     pub fn committedLinkCount(self: *Sink) usize {
-        return self.a11y.links.items.len;
+        return self.pending.items.len;
     }
 
     /// Whether `[start_cp, end_cp)` intersects any of the first `limit`
     /// links. `limit` is clamped because a failed commit can leave the
     /// list shorter than the caller's snapshot of its length.
     pub fn linkOverlaps(self: *Sink, start_cp: usize, end_cp: usize, limit: usize) bool {
-        const links = self.a11y.links.items;
+        const links = self.pending.items;
         for (links[0..@min(limit, links.len)]) |existing| {
             if (start_cp < existing.range.end and
                 end_cp > existing.range.start) return true;
