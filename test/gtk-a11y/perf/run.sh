@@ -69,7 +69,12 @@ export XDG_RUNTIME_DIR="$rt"
 export PULSE_SERVER=unix:/nonexistent
 # BrlAPI's local sockets don't go through XDG_RUNTIME_DIR, so without this
 # the private Orca connects to the user's own brltty and its braille display.
-export BRLAPI_HOST=:perf-none
+# PERF_REAL_BRAILLE=1 allows exactly that, to measure with a display
+# connected: the display then shows the run's output, and the private Orca
+# takes braille keys while it runs.
+if [[ -z "${PERF_REAL_BRAILLE:-}" ]]; then
+	export BRLAPI_HOST=:perf-none
+fi
 export LC_ALL=C.UTF-8 LANG=C.UTF-8
 export GSETTINGS_BACKEND=memory
 export NO_AT_BRIDGE=0 GTK_A11Y=atspi GDK_BACKEND=x11
