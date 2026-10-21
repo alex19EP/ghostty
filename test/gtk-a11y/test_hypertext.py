@@ -146,3 +146,52 @@ def test_repeated_queries_are_stable(session):
         for link in links(session)
     ]
     assert before == after
+
+
+# A regex-matched URL on the row *above* an OSC 8 link, and another below
+# it. The walk finds the OSC 8 link first and the regex pass adds the URLs
+# afterwards, so discovery order is not text order here.
+MIXED_FIRST_URL = "https://example.com/first"
+MIXED_LAST_URL = "https://example.com/last"
+MIXED_SEED_SCRIPT = f"""#!/bin/sh
+printf '%s\\n' '{harness.READY_MARKER}'
+printf '%s\\n' 'before {MIXED_FIRST_URL} end'
+printf '\\033]8;;{harness.LINK_URI}\\033\\\\{harness.LINK_LABEL}\\033]8;;\\033\\\\ trailing\\n'
+printf '%s\\n' 'after {MIXED_LAST_URL} end'
+exec cat
+"""
+
+
+def test_link_indices_follow_text_order(launch):
+    """Link i must start no later than link i + 1.
+
+    Orca reads every link's offsets, one D-Bus round trip each, on every
+    spoken insertion. With a few dozen links on screen that walk is what
+    left it seconds behind on fast scrolling output, so it is being taught
+    to binary-search for the links in a range instead. That search only
+    reads a few offsets, so on an unsorted list it skips links silently
+    rather than failing. Ghostty used to commit OSC 8 links before regex
+    matches, which is unsorted whenever a screen mixes the two.
+    """
+    mixed = launch(seed=MIXED_SEED_SCRIPT, instance="ghostty-a11y-link-order")
+    found = [
+        (
+            Atspi.Hyperlink.get_start_index(link),
+            Atspi.Hyperlink.get_uri(link, 0),
+        )
+        for link in links(mixed)
+    ]
+    assert [uri for _, uri in found] == [
+        MIXED_FIRST_URL,
+        harness.LINK_URI,
+        MIXED_LAST_URL,
+    ], f"links out of text order: {found}"
+    starts = [start for start, _ in found]
+    assert starts == sorted(starts), f"link indices not in offset order: {found}"
+
+    # GetLinkIndex must agree with the reordered indices.
+    text = mixed.text()
+    for index, (_, uri) in enumerate(found):
+        needle = harness.LINK_LABEL if uri == harness.LINK_URI else uri
+        at = text.index(needle) + 1
+        assert Atspi.Hypertext.get_link_index(mixed.terminal, at) == index
