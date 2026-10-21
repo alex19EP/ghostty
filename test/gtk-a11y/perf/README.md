@@ -54,6 +54,10 @@ BrlAPI's sockets don't follow `XDG_RUNTIME_DIR`, so `run.sh` points
 connects to your own brltty and writes to your braille display. Braille
 stays enabled, as it is by default, but has no display.
 
+`PERF_REAL_BRAILLE=1` turns that off, to measure with a display
+connected. Your display then shows the run's output, and the private Orca
+takes braille keys while it runs.
+
 Two environment variables change the private Orca:
 
 | Variable | Effect |
