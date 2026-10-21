@@ -54,6 +54,13 @@ BrlAPI's sockets don't follow `XDG_RUNTIME_DIR`, so `run.sh` points
 connects to your own brltty and writes to your braille display. Braille
 stays enabled, as it is by default, but has no display.
 
+Two environment variables change the private Orca:
+
+| Variable | Effect |
+| --- | --- |
+| `ORCA_NO_BRAILLE=1` | Sets `braille/enabled` to false. |
+| `ORCA_LINK_STACKS=1` | With `--orca-debug`, writes the Python stack of every `get_all_links_in_range()` and `get_all_links()` call into `orca.log` as `LINK STACK:`. |
+
 Orca gets keys from Mutter's `org.freedesktop.a11y.KeyboardMonitor`, as on
 GNOME Wayland:
 - **Under Xvfb,** where nothing provides it, `driver.py` registers a fake
