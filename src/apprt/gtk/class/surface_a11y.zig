@@ -72,8 +72,9 @@ probe_buf: std.ArrayList(u8) = .empty,
 style_runs: std.ArrayList(StyleRun) = .empty,
 
 /// Links in `cached_text`, rebuilt with it. Only populated when
-/// `a11y_hypertext.available` (GTK >= 4.22). Each owns its URI and a
-/// strong reference on its hyperlink object.
+/// `a11y_hypertext.available` (GTK >= 4.22). Each owns its URI and,
+/// once a client has asked for it, a strong reference on its hyperlink
+/// object.
 links: std.ArrayList(Link) = .empty,
 
 /// The previous refresh's `links`, held only for the duration of a
@@ -111,7 +112,14 @@ pub const Range = struct {
 pub const Link = struct {
     range: Range,
     uri: [:0]u8,
-    obj: *a11y_hypertext.AccessibleHyperlink,
+
+    /// Made and parented by `getLink` the first time a client asks for
+    /// this link. Realizing a hyperlink's AT context is the expensive
+    /// part, and while output scrolls the links are replaced every frame,
+    /// so making one for every link up front cost more than finding them.
+    /// A client that knows links are in text order only asks for the few
+    /// it needs.
+    obj: ?*a11y_hypertext.AccessibleHyperlink = null,
 };
 
 /// A maximal run of codepoints sharing one non-default style.
@@ -443,8 +451,8 @@ const Sink = struct {
         };
     }
 
-    /// Sort the pending links by start offset and give each its hyperlink
-    /// object, so link index order is text order. The walk commits OSC 8
+    /// Sort the pending links by start offset and add them to
+    /// `A11y.links`, so link index order is text order. The walk commits OSC 8
     /// links before the regex pass adds its matches, and each configured
     /// regex adds its own sorted run, so discovery order is not text
     /// order once a screen mixes them. Orca relies on text order to find
@@ -469,9 +477,9 @@ const Sink = struct {
 
     /// Append `link` to `A11y.links`, taking ownership of its URI. When the
     /// previous refresh had an identical link at the same index its
-    /// hyperlink object is moved over as is, keeping its AT-SPI bus path
-    /// alive across the frame. Reuse is by index because a hyperlink's
-    /// index is construct-only.
+    /// hyperlink object, if it has one, is moved over as is, keeping its
+    /// AT-SPI bus path alive across the frame. Reuse is by index because a
+    /// hyperlink's index is construct-only.
     fn adoptLink(self: *Sink, link: Pending) void {
         const state = self.a11y;
         const range = link.range;
@@ -492,39 +500,22 @@ const Sink = struct {
                 return;
             }
 
-            // Fall through to a fresh hyperlink, and dispose the rest of
-            // the previous set now so the old object at this index
-            // doesn't shadow the new one on the bus.
+            // Fall through to a new link, and dispose the rest of the
+            // previous set now so the old object at this index doesn't
+            // shadow the new one on the bus.
         }
         if (target_idx < state.links_prev.items.len) {
             state.links_prev_frozen = true;
             disposeLinksFrom(&state.links_prev, state.links_prev_consumed, self.alloc);
         }
 
-        var bounds: gtk.AccessibleTextRange = .{
-            .f_start = range.start,
-            .f_length = range.end - range.start,
-        };
-
-        // Not parented here: setting the parent realizes the hyperlink's
-        // AT context, which can make the client query us back, re-entering
-        // `refreshCache` while this one is still building the cache.
-        // `wireLinks` parents them afterwards.
-        const obj = a11y_hypertext.hyperlinkNew(
-            @ptrCast(self.surface),
-            @intCast(target_idx),
-            uri_owned.ptr,
-            &bounds,
-        );
-
+        // No hyperlink object yet; `getLink` makes it when asked.
         state.links.append(self.alloc, .{
             .range = range,
             .uri = uri_owned,
-            .obj = obj,
         }) catch |err| {
             log.warn("ax link append failed: {}", .{err});
             self.alloc.free(uri_owned);
-            obj.unref();
         };
     }
 
@@ -574,7 +565,7 @@ fn clearLinks(list: *std.ArrayList(Link), alloc: Allocator) void {
 fn disposeLinksFrom(list: *std.ArrayList(Link), from: usize, alloc: Allocator) void {
     if (from >= list.items.len) return;
     for (list.items[from..]) |link| {
-        unparentAndUnref(link.obj);
+        if (link.obj) |obj| unparentAndUnref(obj);
         alloc.free(link.uri);
     }
     list.shrinkRetainingCapacity(from);
@@ -1293,33 +1284,16 @@ pub fn initAccessibleHypertextInterface(
     iface.f_get_link_at = &getLinkAt;
 }
 
-/// The surface's links, refreshed and parented so they are ready to
-/// hand to the bridge. A hyperlink whose AT context isn't realized yet
-/// has no bus name, and returning one crashes the client with a D-Bus
-/// assert.
-fn wiredLinks(hypertext: *a11y_hypertext.AccessibleHypertext) ?struct { *Surface, []Link } {
+/// The surface's links, refreshed.
+fn currentLinks(hypertext: *a11y_hypertext.AccessibleHypertext) ?struct { *Surface, []Link } {
     const surface = gobject.ext.cast(Surface, hypertext) orelse return null;
     const self = surface.a11y();
     _ = self.refreshCache(surface);
-    wireLinks(surface, self.links.items);
     return .{ surface, self.links.items };
 }
 
-/// Parent each hyperlink to the surface, realizing its AT context. Must
-/// run outside `refreshCache`'s renderer mutex: realizing emits a tree
-/// change the client may answer by querying us, which would re-enter
-/// `refreshCache` and deadlock. Repeats are cheap; GTK skips a parent
-/// that is already set.
-fn wireLinks(surface: *Surface, links: []const Link) void {
-    const parent: *gtk.Accessible = surface.as(gtk.Accessible);
-    for (links) |link| {
-        const accessible: *gtk.Accessible = @ptrCast(@alignCast(link.obj));
-        accessible.setAccessibleParent(parent, null);
-    }
-}
-
 fn getNLinks(hypertext: *a11y_hypertext.AccessibleHypertext) callconv(.c) c_uint {
-    _, const links = wiredLinks(hypertext) orelse return 0;
+    _, const links = currentLinks(hypertext) orelse return 0;
     return @intCast(links.len);
 }
 
@@ -1329,7 +1303,7 @@ fn getLink(
 ) callconv(.c) *a11y_hypertext.AccessibleHyperlink {
     // Never fails for a real surface; the interface is only installed on
     // one.
-    const surface, const links = wiredLinks(hypertext).?;
+    const surface, const links = currentLinks(hypertext).?;
 
     // The contract says `index` is below the link count; Orca breaks it
     // when the link set shrinks between its `GetNLinks` and a queued
@@ -1338,7 +1312,31 @@ fn getLink(
         log.debug("ax GetLink({d}) out of bounds (links={d})", .{ index, links.len });
         return linkSentinel(surface);
     }
-    return links[index].obj;
+
+    const link = &links[index];
+    if (link.obj) |obj| return obj;
+
+    var bounds: gtk.AccessibleTextRange = .{
+        .f_start = link.range.start,
+        .f_length = link.range.end - link.range.start,
+    };
+    const obj = a11y_hypertext.hyperlinkNew(
+        @ptrCast(surface),
+        index,
+        link.uri.ptr,
+        &bounds,
+    );
+    link.obj = obj;
+
+    // Parenting realizes the hyperlink's AT context. It must happen
+    // before the bridge gets the object: one with no AT context has no
+    // bus name, and returning it crashes the client with a D-Bus assert.
+    // It must also happen outside `refreshCache`'s renderer mutex,
+    // because realizing emits a tree change the client may answer by
+    // querying us, which would re-enter `refreshCache` and deadlock.
+    const accessible: *gtk.Accessible = @ptrCast(@alignCast(obj));
+    accessible.setAccessibleParent(surface.as(gtk.Accessible), null);
+    return obj;
 }
 
 /// The surface's sentinel hyperlink, created and parented on first use.
@@ -1365,7 +1363,7 @@ fn getLinkAt(
     hypertext: *a11y_hypertext.AccessibleHypertext,
     offset: c_uint,
 ) callconv(.c) c_uint {
-    _, const links = wiredLinks(hypertext) orelse return std.math.maxInt(c_uint);
+    _, const links = currentLinks(hypertext) orelse return std.math.maxInt(c_uint);
     for (links, 0..) |link, i| {
         if (offset >= link.range.start and offset < link.range.end) return @intCast(i);
     }
