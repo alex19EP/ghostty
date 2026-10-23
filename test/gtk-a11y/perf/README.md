@@ -65,6 +65,17 @@ Two environment variables change the private Orca:
 | `ORCA_NO_BRAILLE=1` | Sets `braille/enabled` to false. |
 | `ORCA_LINK_STACKS=1` | With `--orca-debug`, writes the Python stack of every `get_all_links_in_range()` and `get_all_links()` call into `orca.log` as `LINK STACK:`. |
 
+The private Orca also gets a stand-in for systemd's watchdog, with a 5 s
+limit: it pings `NOTIFY_SOCKET` from its main loop, and `watchdog.jsonl`
+records the pings.
+
+Three variables size the run, for terminals much wider than 80x24:
+
+| Variable | Effect |
+| --- | --- |
+| `PERF_COLS`, `PERF_ROWS` | Ghostty's window size in cells (default 80x24). |
+| `PERF_SCREEN` | The virtual monitor (default `1280x1024`); 383x87 needs `3840x2160`. |
+
 Orca gets keys from Mutter's `org.freedesktop.a11y.KeyboardMonitor`, as on
 GNOME Wayland:
 - **Under Xvfb,** where nothing provides it, `driver.py` registers a fake
@@ -77,7 +88,7 @@ GNOME Wayland:
 
 | Option | Effect |
 | --- | --- |
-| `--only=<phase>` | Run only this phase. Repeat it for several. Phases: `type_cat_40cps`, `type_shell_15cps`, `flood_seq`, `flood_paced` (200 lines/s), `flood_fast` (4,000 lines/s), `flood_burst`. |
+| `--only=<phase>` | Run only this phase. Repeat it for several. Phases: `type_cat_40cps`, `type_shell_15cps`, `flood_seq`, `flood_paced` (200 lines/s), `flood_fast` (4,000 lines/s), `flood_burst`, `pacman_dl` (pacman's parallel download bars), `pacman_review` (heavier downloads read with flat review: KP_9 to the bottom, then KP_7 upwards; run it on its own). |
 | `--nolinks` | Ghostty with `link-url = false`, to separate link cost from everything else. |
 | `--perf` | `perf record` the terminal and Orca during floods (`perf-<phase>-{term,orca}.data`). Orca runs with `python3 -X perf`, so its Python frames are named. Needs `perf_event_paranoid` ≤ 2. |
 | `--props` | Also log the bodies of `PropertyChange` signals (`props.log`). |
@@ -92,6 +103,9 @@ GNOME Wayland:
   time Orca spent blocked on replies. `by member` shows which calls.
 - **Orca still busy after**: how long Orca kept working after the output
   stopped. This is the lag a user hears.
+- **Orca main-loop stall**: the longest gap between watchdog pings. Orca
+  pings every 1.25 s, so that is the floor; a gap over 5 s is a run in
+  which systemd would have killed Orca.
 - **Speech**: utterances (the logging module records each one), key-to-speech
   latency, and key-to-`TextChanged` latency.
 - **probe**: a client-side `GetText`/`CharacterCount` every 100 ms. Unlike
@@ -114,6 +128,7 @@ perf report -i <dir>/perf-flood_fast-term.data --stdio --comms ghostty \
 | `driver.py` | Starts speech-dispatcher, Orca and the terminal, types, runs the phases, records. |
 | `analyze.py` | Summarises run directories. Also works on `live.py` output. |
 | `pacer.py` | Writes N build-log-like lines at R lines/s. |
+| `pacman_sim.py` | Draws pacman 7.1's parallel download progress bars, without downloading. |
 | `orca_launch.py` | Runs Orca next to your own. |
 | `session.conf` | A session bus with no activatable services, so nothing auto-starts. |
 | `live.py`, `live_all.sh` | Measure your own running Orca in your real session. |
