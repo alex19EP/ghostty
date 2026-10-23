@@ -86,6 +86,10 @@ links: std.ArrayList(Link) = .empty,
 /// with it. Empty outside a refresh.
 links_prev: std.ArrayList(Link) = .empty,
 
+/// Configured regex link matches per row of text, so a refresh only
+/// runs the patterns on rows that changed.
+regex_links: a11y.text.RegexLinkCache = .{},
+
 /// How many `links_prev` entries were reused this refresh. Reuse is
 /// positional, so this only grows.
 links_prev_consumed: usize = 0,
@@ -142,6 +146,7 @@ pub fn deinit(self: *A11y, alloc: Allocator) void {
     disposeLinksFrom(&self.links_prev, 0, alloc);
     self.links_prev.deinit(alloc);
     if (self.link_sentinel) |s| unparentAndUnref(s);
+    self.regex_links.deinit(alloc);
     self.style_runs.deinit(alloc);
     self.probe_buf.deinit(alloc);
     self.cached_widths.deinit(alloc);
@@ -384,7 +389,8 @@ fn refreshCache(self: *A11y, surface: *Surface) ?[:0]const u8 {
     // keeps them alive is that the swap and this run on the same (main)
     // thread. Holding the lock here would cost the IO thread ~10x the
     // walk itself on a large viewport for no safety benefit.
-    if (track_links) a11y.text.matchRegexLinks(
+    if (track_links) self.regex_links.apply(
+        alloc,
         buffer.written(),
         core_surface.config.links,
         &sink,
@@ -412,7 +418,7 @@ fn refreshCache(self: *A11y, surface: *Surface) ?[:0]const u8 {
     return self.cached_text;
 }
 
-/// The sink `a11y.text.buildWithSink` and `matchRegexLinks` report into
+/// The sink `a11y.text.buildWithSink` and `RegexLinkCache.apply` report into
 /// during a `refreshCache`. The walk half runs under the renderer mutex,
 /// so it must not do anything that can call back into us; see
 /// `commitLink`.
