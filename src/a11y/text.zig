@@ -445,9 +445,10 @@ fn closeStyle(sink: anytype, cur: *?StyleRun, end_cp: usize) void {
 /// here: each visual line is its own range, as with OSC 8. A user pattern
 /// that would match across a line break matches each row on its own.
 ///
-/// Every pattern is matched regardless of its `highlight` mode. That gate
-/// decides when a sighted user sees a cue, not whether a region is a
-/// link, and a screen reader user cannot hover to reveal one.
+/// Every pattern is matched regardless of its `highlight` mode, which
+/// depends on a mouse a screen reader user doesn't have. The caller
+/// decides when links are worth finding: the GTK surface only looks in
+/// caret mode.
 pub const RegexLinkCache = struct {
     /// Row text to its matches, from the last `apply`. Keys and values
     /// are owned.

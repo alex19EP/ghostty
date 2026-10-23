@@ -1,4 +1,4 @@
-"""GtkAccessibleHypertext — OSC 8 and regex-matched links.
+"""GtkAccessibleHypertext — OSC 8 links, and regex-matched ones in caret mode.
 
 Orca announces links inline by reading this interface directly
 (`_adjust_for_links` in its speech presenter); there are no link-role
@@ -8,6 +8,8 @@ an out-of-bounds `GetLink` racing a link-count decrease.
 """
 
 from __future__ import annotations
+
+import time
 
 import gi
 
@@ -35,11 +37,37 @@ def test_osc8_link_is_exposed(session):
     )
 
 
-def test_regex_matched_url_is_exposed(session):
-    """A bare URL in the output is matched by the configured `link-url` regex."""
-    assert harness.BARE_URL in uris(session), (
-        f"regex-matched URL missing; got {sorted(uris(session))}"
+def in_caret_mode(session) -> None:
+    """Enter caret mode (the harness binds F7) and wait for its frame."""
+    session.send_key("F7")
+    time.sleep(0.3)
+
+
+def test_regex_matched_url_is_only_exposed_in_caret_mode(session):
+    """A bare URL matched by the configured `link-url` regex is a link only
+    in caret mode, the counterpart of the Ctrl hover that shows it to a
+    sighted user. Matching every changed frame was what starved the main
+    thread on wide terminals. Escape leaves caret mode via its key table.
+    """
+    assert harness.BARE_URL not in uris(session), (
+        f"regex-matched URL exposed outside caret mode; got {sorted(uris(session))}"
     )
+
+    in_caret_mode(session)
+    try:
+        assert harness.BARE_URL in uris(session), (
+            f"regex-matched URL missing in caret mode; got {sorted(uris(session))}"
+        )
+        assert harness.LINK_URI in uris(session), "OSC 8 link lost in caret mode"
+    finally:
+        session.send_key("Escape")
+        time.sleep(0.3)
+
+    assert harness.BARE_URL not in uris(session), (
+        f"regex-matched URL still exposed after leaving caret mode; "
+        f"got {sorted(uris(session))}"
+    )
+    assert harness.LINK_URI in uris(session), "OSC 8 link lost after caret mode"
 
 
 def test_osc8_link_brackets_its_label(session):
@@ -174,6 +202,8 @@ def test_link_indices_follow_text_order(launch):
     matches, which is unsorted whenever a screen mixes the two.
     """
     mixed = launch(seed=MIXED_SEED_SCRIPT, instance="ghostty-a11y-link-order")
+    # Regex links are only exposed in caret mode.
+    in_caret_mode(mixed)
     found = [
         (
             Atspi.Hyperlink.get_start_index(link),
