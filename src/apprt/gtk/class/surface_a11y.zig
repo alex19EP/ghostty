@@ -59,6 +59,11 @@ last_selection: ?Range = null,
 /// unchanged frame never converts offsets.
 last_sel_raw: ?SelRaw = null,
 
+/// Whether caret mode was on at the last probe. Regex links are only
+/// exposed in caret mode, so toggling it changes the links while the
+/// text, caret and selection can all stay the same.
+last_caret_mode: bool = false,
+
 /// Set on every rendered frame; cleared when the cache is confirmed
 /// to still match the viewport.
 cache_stale: bool = false,
@@ -360,12 +365,14 @@ fn refreshCache(self: *A11y, surface: *Surface) ?[:0]const u8 {
 
     // The renderer mutex covers only the walk; everything after this
     // point reads `buffer`, which is our own memory.
+    var caret_mode = false;
     const result = result: {
         core_surface.renderer_state.mutex.lockUncancelable(global.io());
         defer core_surface.renderer_state.mutex.unlock(global.io());
 
         const screen: *terminal.Screen =
             core_surface.renderer_state.terminal.screens.active;
+        caret_mode = screen.caret_mode;
 
         break :result a11y.text.buildWithSink(
             &buffer.writer,
@@ -389,7 +396,14 @@ fn refreshCache(self: *A11y, surface: *Surface) ?[:0]const u8 {
     // keeps them alive is that the swap and this run on the same (main)
     // thread. Holding the lock here would cost the IO thread ~10x the
     // walk itself on a large viewport for no safety benefit.
-    if (track_links) self.regex_links.apply(
+    //
+    // Only in caret mode, the screen reader's counterpart of the Ctrl
+    // hover that shows these links to a sighted user: the regexes are
+    // the expensive part of a refresh, and output that replaces the whole
+    // viewport every frame would pay for them every frame. OSC 8 links
+    // cost nothing extra and are always exposed. Activation doesn't
+    // depend on this either way: `open_link` finds the link itself.
+    if (track_links and caret_mode) self.regex_links.apply(
         alloc,
         buffer.written(),
         core_surface.config.links,
@@ -609,6 +623,7 @@ fn probeChanged(self: *A11y, surface: *Surface) bool {
     defer self.probe_buf = probe.toArrayList();
 
     var sel_raw: ?SelRaw = null;
+    var caret_mode = false;
     const result = result: {
         core_surface.renderer_state.mutex.lockUncancelable(global.io());
         defer core_surface.renderer_state.mutex.unlock(global.io());
@@ -617,6 +632,7 @@ fn probeChanged(self: *A11y, surface: *Surface) bool {
             core_surface.renderer_state.terminal.screens.active;
 
         sel_raw = selectionRaw(screen);
+        caret_mode = screen.caret_mode;
 
         break :result a11y.text.build(
             &probe.writer,
@@ -634,10 +650,13 @@ fn probeChanged(self: *A11y, surface: *Surface) bool {
     // we return, so a change is reported exactly once.
     const selection_moved = !std.meta.eql(self.last_sel_raw, sel_raw);
     self.last_sel_raw = sel_raw;
+    // Same for caret mode, which decides whether regex links are exposed.
+    const caret_mode_toggled = caret_mode != self.last_caret_mode;
+    self.last_caret_mode = caret_mode;
 
     const text = probe.written();
     if (!std.mem.eql(u8, old_text, text)) return true;
-    if (selection_moved) return true;
+    if (selection_moved or caret_mode_toggled) return true;
 
     // Text is identical, so the caret's byte offset converts against
     // the same bytes the cache was built from.
