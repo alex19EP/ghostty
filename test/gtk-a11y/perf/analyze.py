@@ -106,6 +106,9 @@ def analyze(run):
 
         keys = [m for m in marks if m["kind"] in ("key", "probe") and m.get("phase") == name]
         key_lat, echo_lat, missing = [], [], 0
+        # Keys named by keysym (flat review's KP_Home and so on) speak a line,
+        # not their own name, so only characters can be matched to speech.
+        keys = [k for k in keys if len(k["ch"]) == 1]
         for k in keys:
             want = "space" if k["ch"] == " " else k["ch"]
             hit = next((s for s in speech if s[0] >= k["t_press"] and s[1].strip() == want), None)
@@ -124,6 +127,18 @@ def analyze(run):
             res["key_to_term_event_ms"] = {"p50": pct(echo_lat, 50) * 1000, "p90": pct(echo_lat, 90) * 1000}
             res["probes"] = [(k["ch"], k.get("during"), round(l * 1000)) for k, l in key_lat
                              if k["kind"] == "probe"]
+        wd_file = run / "watchdog.jsonl"
+        if wd_file.exists():
+            pings = [r["t"] for r in map(json.loads, wd_file.read_text().splitlines())
+                     if "WATCHDOG=1" in r["msg"]]
+            # The last ping before the phase, every ping in it, and the end of
+            # the phase, so a stall still running at the end counts too.
+            i = bisect.bisect_left(pings, t0)
+            ts = pings[max(0, i - 1):bisect.bisect_right(pings, t1)] + [t1]
+            gaps = [b - a for a, b in zip(ts, ts[1:])]
+            if gaps:
+                res["watchdog"] = {"max_gap_s": max(gaps),
+                                   "over_5s": sum(1 for g in gaps if g > 5)}
         probe_file = run / "probe.jsonl"
         if probe_file.exists():
             pr = [json.loads(l) for l in probe_file.read_text().splitlines() if l.strip()]
@@ -167,6 +182,9 @@ def show(r):
             q = p.get(f"probe_{call}_ms")
             if q and q["n"]:
                 print(f"     probe {call:17s} n={q['n']:4d} p50 {q['p50']:.2f}ms p99 {q['p99']:.1f}ms max {q['max']:.1f}ms")
+        if p.get("watchdog"):
+            w = p["watchdog"]
+            print(f"     Orca main-loop stall (watchdog pings): max {w['max_gap_s']:.2f}s, {w['over_5s']} over 5s")
         print(f"     speech: {p['utterances']} utterances, {p['spoken_chars']} chars")
         if "key_to_speech_ms" in p:
             k = p["key_to_speech_ms"]
