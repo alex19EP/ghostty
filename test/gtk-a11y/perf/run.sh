@@ -89,15 +89,16 @@ if [[ -n "${GPU:-}" ]]; then
 	# activation and Orca never reaches the terminal. The inner script
 	# turns a11y back on for everything it starts.
 	status=0
+	# PERF_SCREEN: a bigger monitor, for big PERF_COLS/PERF_ROWS windows.
 	PERF_INNER=1 GTK_A11Y=none dbus-run-session --config-file="$here/session.conf" -- \
-		mutter --headless --wayland --virtual-monitor 1280x1024 \
+		mutter --headless --wayland --virtual-monitor "${PERF_SCREEN:-1280x1024}" \
 		--wayland-display "wl-perf-$$" -- "$here/run.sh" "$@" || status=$?
 	exit $status
 fi
 export LIBGL_ALWAYS_SOFTWARE=1
 
 dfd="$(mktemp)"
-Xvfb -displayfd 3 -screen 0 1280x1024x24 -nolisten tcp 3>"$dfd" &
+Xvfb -displayfd 3 -screen 0 "${PERF_SCREEN:-1280x1024}x24" -nolisten tcp 3>"$dfd" &
 xvfb_pid=$!
 trap 'kill $xvfb_pid 2>/dev/null || true; rm -f "$dfd"; rm -rf "$rt"' EXIT
 for _ in $(seq 100); do [[ -s "$dfd" ]] && break; sleep 0.1; done

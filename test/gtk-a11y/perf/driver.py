@@ -11,6 +11,7 @@ import collections
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -221,9 +222,30 @@ if perf_on:
     # Writes /tmp/perf-<pid>.map, which names Python frames for perf report.
     orca_argv[1:1] = ["-X", "perf"]
 
+# A stand-in for systemd's watchdog. Given NOTIFY_SOCKET and WATCHDOG_USEC,
+# Orca pings from a high-priority main-loop timeout every quarter interval,
+# so the longest gap between pings is the longest main-loop stall as systemd
+# sees it. 5 s is a common override; Orca's unit ships 10 s. Abstract
+# socket, because the run directory's path is too long for sun_path.
+wd_name = f"ghostty-perf-watchdog-{os.getpid()}"
+wd_sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+wd_sock.bind("\0" + wd_name)
+wd_log = open(out / "watchdog.jsonl", "w")
+
+
+def watchdog_reader():
+    while True:
+        msg = wd_sock.recv(4096)
+        wd_log.write(json.dumps({"t": time.time(), "msg": msg.decode(errors="replace")}) + "\n")
+        wd_log.flush()
+
+
+threading.Thread(target=watchdog_reader, daemon=True).start()
+orca_env = dict(base_env, NOTIFY_SOCKET="@" + wd_name, WATCHDOG_USEC="5000000")
+
 
 def start_orca():
-    p = spawn(orca_argv, log=out / "orca.stdout", env=base_env)
+    p = spawn(orca_argv, log=out / "orca.stdout", env=orca_env)
     time.sleep(5)
     return p
 
@@ -242,6 +264,9 @@ done_file = out / "d"
 # output.
 (out / "p1").write_text(f"exec python3 -I {here}/pacer.py 1500 200\n")
 (out / "p2").write_text(f"exec python3 -I {here}/pacer.py 20000 4000\n")
+(out / "p3").write_text(f"exec python3 -I {here}/pacman_sim.py 80 16 40\n")
+# Heavier: more packages, faster, and four big ones that keep bars moving.
+(out / "p4").write_text(f"exec python3 -I {here}/pacman_sim.py 200 16 120 1 4\n")
 shell = ["bash", "--norc", "--noprofile", "-i"]
 term_env = dict(base_env)
 term_env["PS1"] = "$ "
@@ -250,13 +275,15 @@ if terminal.startswith("ghostty"):
     binary = terminal.split("=", 1)[1] if "=" in terminal else "/usr/bin/ghostty"
     cfg = out / "config" / "ghostty"
     cfg.mkdir(parents=True, exist_ok=True)
+    # PERF_COLS / PERF_ROWS: a bigger window, closer to a maximised one.
+    # Flat review's work grows with the number of lines.
     (cfg / "config").write_text(
-        """x11-instance-name = ghostty-perf
+        f"""x11-instance-name = ghostty-perf
 gtk-single-instance = false
 gtk-titlebar = false
 window-decoration = none
-window-width = 80
-window-height = 24
+window-width = {os.environ.get("PERF_COLS", "80")}
+window-height = {os.environ.get("PERF_ROWS", "24")}
 shell-integration = none
 confirm-close-surface = false
 resize-overlay = never
@@ -515,9 +542,10 @@ def typing(name, cps, chars=TEXT * 2):
     cpu_snapshot(f"{name}:end")
 
 
-def flood(name, cmd, probes_during=0.0):
+def flood(name, cmd, probes_during=0.0, probe_keys="jkvpzbgh"):
     """Run `cmd`, optionally probing with a key every `probes_during` seconds while
-    output is running, then probe once right after the producer exits."""
+    output is running, then probe once right after the producer exits.
+    `probe_keys` are characters or keysym names, pressed in turn."""
     wait_orca_idle()
     if done_file.exists():
         done_file.unlink()
@@ -538,7 +566,6 @@ def flood(name, cmd, probes_during=0.0):
     type_cmd(f"{cmd};date +%s.%N>d")
     mark("phase", name=name, state="cmd-sent")
     if probes_during:
-        probe_keys = "jkvpzbgh"
         i = 0
         while not (done_file.exists() and done_file.read_text().strip()):
             time.sleep(probes_during)
@@ -575,6 +602,14 @@ phases = {
     "flood_paced": lambda: flood("flood_paced", "sh p1", probes_during=0.5),
     "flood_fast": lambda: flood("flood_fast", "sh p2", probes_during=0.5),
     "flood_burst": lambda: flood("flood_burst", "ls -la /usr/lib|head -3000"),
+    "pacman_dl": lambda: flood("pacman_dl", "sh p3", probes_during=0.5),
+    # Flat review during the downloads, NumLock off: KP_9 (next line) down
+    # to the last line, then KP_7 (previous line) reading upwards, over and
+    # over. Run it on its own, since flat review stays active afterwards.
+    "pacman_review": lambda: flood(
+        "pacman_review", "sh p4", probes_during=0.15,
+        probe_keys=["KP_Page_Up"] * (int(os.environ.get("PERF_ROWS", "24")) + 6)
+        + ["KP_Home"] * int(os.environ.get("PERF_ROWS", "24"))),
 }
 try:
     for key, fn in phases.items():
