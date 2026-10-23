@@ -18,6 +18,7 @@
 //! `unicode.utf8.cpCount` before handing it out.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 const terminal = @import("../terminal/main.zig");
 const terminal_hyperlink = @import("../terminal/hyperlink.zig");
 const unicode = @import("../unicode/main.zig");
@@ -177,7 +178,7 @@ pub fn build(
 /// the call, so a sink that keeps it must copy it. Sinks swallow their own
 /// allocation failures: a dropped link degrades to plain text, which is
 /// better than failing the whole snapshot. The last two methods exist for
-/// `matchRegexLinks`.
+/// `RegexLinkCache.apply`.
 ///
 /// Style runs cover maximal spans of identically styled, non-default
 /// codepoints; gaps between them (blanks, row separators) are default.
@@ -428,82 +429,215 @@ fn closeStyle(sink: anytype, cur: *?StyleRun, end_cp: usize) void {
     cur.* = null;
 }
 
-/// Scan already-built viewport `text` for configured regex links (bare
-/// URLs, user patterns) and commit each hit that doesn't overlap an OSC 8
-/// link to `sink`.
+/// Configured regex links (bare URLs, user patterns) in already-built
+/// viewport text, matched one row at a time and cached by row text, so a
+/// refresh only runs the patterns on rows it hasn't seen.
 ///
-/// Run this after `buildWithSink`, so the OSC 8 ranges are already
-/// committed: when the two overlap the OSC 8 link wins, since its URI is
-/// explicit and the regex is a guess. Every pattern is matched regardless
-/// of its `highlight` mode. That gate decides when a sighted user sees a
-/// cue, not whether a region is a link, and a screen reader user cannot
-/// hover to reveal one.
+/// The cache is what keeps this affordable. The default URL/path regex
+/// gets slower than linear in row width on long runs of path characters
+/// such as progress bars: a 383x87 viewport of pacman downloads took
+/// ~67 ms per rebuild against 0.3 ms for a build log, and with a rebuild
+/// on every changed frame that kept the main thread busy and every AT
+/// client waiting on it. Keyed by text rather than row index, so output
+/// that scrolls still hits.
 ///
-/// `link_cfgs` is any slice whose elements have a `regex` field with
-/// oniguruma's `search` interface. This does not need the renderer mutex:
-/// it reads only `text` and the regexes, and the caller keeps those alive.
-pub fn matchRegexLinks(
-    text: []const u8,
-    link_cfgs: anytype,
-    sink: anytype,
-) void {
-    if (text.len == 0 or link_cfgs.len == 0) return;
+/// Per row and not over the whole viewport because links never span rows
+/// here: each visual line is its own range, as with OSC 8. A user pattern
+/// that would match across a line break matches each row on its own.
+///
+/// Every pattern is matched regardless of its `highlight` mode. That gate
+/// decides when a sighted user sees a cue, not whether a region is a
+/// link, and a screen reader user cannot hover to reveal one.
+pub const RegexLinkCache = struct {
+    /// Row text to its matches, from the last `apply`. Keys and values
+    /// are owned.
+    rows: Rows = .empty,
 
-    // Only dedup against the OSC 8 links. Two configured regexes that
-    // both match a span both land, which announces no worse than a
-    // duplicated OSC 8 link would.
-    const osc8_end = sink.committedLinkCount();
+    /// The patterns `rows` was matched with. A different slice means the
+    /// config changed: the new one is built before the old one is freed,
+    /// so it can never reuse its address.
+    cfgs_ptr: ?*const anyopaque = null,
+    cfgs_len: usize = 0,
 
-    for (link_cfgs) |*link_cfg| {
-        // Matches arrive in byte order, so the byte-to-codepoint
-        // conversion advances monotonically instead of rescanning from
-        // the start for every match.
-        var scan_byte: usize = 0;
-        var scan_cp: usize = 0;
+    const Rows = std.StringHashMapUnmanaged([]const RowMatch);
 
-        var byte_offset: usize = 0;
-        while (byte_offset < text.len) {
-            var region = link_cfg.regex.search(
-                text[byte_offset..],
-                .{},
-            ) catch |err| switch (err) {
-                error.Mismatch => break,
-                else => {
-                    log.warn("regex link search failed: {}", .{err});
-                    break;
-                },
-            };
-            defer region.deinit();
+    /// One hit, relative to the start of its row.
+    const RowMatch = struct {
+        start_byte: u32,
+        end_byte: u32,
+        start_cp: u32,
+        end_cp: u32,
+    };
 
-            const abs_start = byte_offset + @as(usize, @intCast(region.starts()[0]));
-            const abs_end = byte_offset + @as(usize, @intCast(region.ends()[0]));
+    pub fn deinit(self: *RegexLinkCache, alloc: Allocator) void {
+        freeRows(&self.rows, alloc);
+        self.rows.deinit(alloc);
+        self.* = .{};
+    }
 
-            // Step past a zero-width match, or `a*` loops forever.
-            byte_offset = if (abs_end > byte_offset) abs_end else byte_offset + 1;
-            if (abs_end <= abs_start) continue;
+    /// Commit each hit in `text` that doesn't overlap an OSC 8 link to
+    /// `sink`. Run this after `buildWithSink`, so the OSC 8 ranges are
+    /// already committed: when the two overlap the OSC 8 link wins, since
+    /// its URI is explicit and the regex is a guess.
+    ///
+    /// `link_cfgs` is any slice whose elements have a `regex` field with
+    /// oniguruma's `search` interface. This does not need the renderer
+    /// mutex: it reads only `text` and the regexes, and the caller keeps
+    /// those alive. Allocation failure drops links, which degrades to
+    /// plain text.
+    pub fn apply(
+        self: *RegexLinkCache,
+        alloc: Allocator,
+        text: []const u8,
+        link_cfgs: anytype,
+        sink: anytype,
+    ) void {
+        // Through the first element, so a pointer to an array works too.
+        const cfgs_ptr: ?*const anyopaque = if (link_cfgs.len > 0) @ptrCast(&link_cfgs[0]) else null;
+        if (cfgs_ptr != self.cfgs_ptr or link_cfgs.len != self.cfgs_len) {
+            freeRows(&self.rows, alloc);
+            self.cfgs_ptr = cfgs_ptr;
+            self.cfgs_len = link_cfgs.len;
+        }
+        if (link_cfgs.len == 0) return;
 
-            // A user regex may cross a row; clip at the newline so the
-            // link stays on one visual row like OSC 8 runs do.
-            const clipped_end = if (std.mem.indexOfScalar(u8, text[abs_start..abs_end], '\n')) |i|
-                abs_start + i
-            else
-                abs_end;
-            if (clipped_end <= abs_start) continue;
+        // Only dedup against the OSC 8 links. Two configured regexes that
+        // both match a span both land, which announces no worse than a
+        // duplicated OSC 8 link would.
+        const osc8_end = sink.committedLinkCount();
 
-            while (scan_byte < abs_start) : (scan_cp += 1) {
-                scan_byte += unicode.utf8.cpLen(text[scan_byte]);
+        // Rows seen this time move over from `rows` as they are reached;
+        // whatever is left in `rows` afterwards is gone from the viewport.
+        var next: Rows = .empty;
+        defer {
+            freeRows(&self.rows, alloc);
+            self.rows.deinit(alloc);
+            self.rows = next;
+        }
+
+        var scratch: std.ArrayList(RowMatch) = .empty;
+        defer scratch.deinit(alloc);
+
+        var row_cp: usize = 0;
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |row| {
+            // The row and its `\n`. The last row has none, but nothing
+            // follows it.
+            defer row_cp += unicode.utf8.cpCount(row) + 1;
+            if (row.len == 0) continue;
+
+            const matches = self.rowMatches(alloc, &next, row, link_cfgs, &scratch);
+            for (matches) |m| {
+                const start = row_cp + m.start_cp;
+                const end = row_cp + m.end_cp;
+                if (sink.linkOverlaps(start, end, osc8_end)) continue;
+                sink.commitLink(start, end, row[m.start_byte..m.end_byte]);
             }
-            const cp_start = scan_cp;
-            while (scan_byte < clipped_end) : (scan_cp += 1) {
-                scan_byte += unicode.utf8.cpLen(text[scan_byte]);
-            }
-            const cp_end = scan_cp;
-
-            if (sink.linkOverlaps(cp_start, cp_end, osc8_end)) continue;
-            sink.commitLink(cp_start, cp_end, text[abs_start..clipped_end]);
         }
     }
-}
+
+    /// `row`'s matches: from this refresh if the row appeared already,
+    /// else from the last one, else found now. The result is valid until
+    /// the next call.
+    fn rowMatches(
+        self: *RegexLinkCache,
+        alloc: Allocator,
+        next: *Rows,
+        row: []const u8,
+        link_cfgs: anytype,
+        scratch: *std.ArrayList(RowMatch),
+    ) []const RowMatch {
+        if (next.get(row)) |matches| return matches;
+        if (self.rows.fetchRemove(row)) |kv| {
+            next.putNoClobber(alloc, kv.key, kv.value) catch {
+                // Still correct, just uncached: hand back a copy that
+                // outlives the entry.
+                scratch.clearRetainingCapacity();
+                scratch.appendSlice(alloc, kv.value) catch {};
+                alloc.free(kv.key);
+                alloc.free(kv.value);
+                return scratch.items;
+            };
+            return kv.value;
+        }
+
+        scratch.clearRetainingCapacity();
+        matchRow(alloc, row, link_cfgs, scratch);
+        const key = alloc.dupe(u8, row) catch return scratch.items;
+        const value = alloc.dupe(RowMatch, scratch.items) catch {
+            alloc.free(key);
+            return scratch.items;
+        };
+        next.putNoClobber(alloc, key, value) catch {
+            alloc.free(key);
+            alloc.free(value);
+            return scratch.items;
+        };
+        return value;
+    }
+
+    /// Run every pattern over one row, appending the hits to `out`.
+    fn matchRow(
+        alloc: Allocator,
+        row: []const u8,
+        link_cfgs: anytype,
+        out: *std.ArrayList(RowMatch),
+    ) void {
+        for (link_cfgs) |*link_cfg| {
+            // Matches arrive in byte order, so the byte-to-codepoint
+            // conversion advances monotonically instead of rescanning
+            // from the start for every match.
+            var scan_byte: usize = 0;
+            var scan_cp: usize = 0;
+
+            var byte_offset: usize = 0;
+            while (byte_offset < row.len) {
+                var region = link_cfg.regex.search(
+                    row[byte_offset..],
+                    .{},
+                ) catch |err| switch (err) {
+                    error.Mismatch => break,
+                    else => {
+                        log.warn("regex link search failed: {}", .{err});
+                        break;
+                    },
+                };
+                defer region.deinit();
+
+                const abs_start = byte_offset + @as(usize, @intCast(region.starts()[0]));
+                const abs_end = byte_offset + @as(usize, @intCast(region.ends()[0]));
+
+                // Step past a zero-width match, or `a*` loops forever.
+                byte_offset = if (abs_end > byte_offset) abs_end else byte_offset + 1;
+                if (abs_end <= abs_start) continue;
+
+                while (scan_byte < abs_start) : (scan_cp += 1) {
+                    scan_byte += unicode.utf8.cpLen(row[scan_byte]);
+                }
+                const cp_start = scan_cp;
+                while (scan_byte < abs_end) : (scan_cp += 1) {
+                    scan_byte += unicode.utf8.cpLen(row[scan_byte]);
+                }
+
+                out.append(alloc, .{
+                    .start_byte = @intCast(abs_start),
+                    .end_byte = @intCast(abs_end),
+                    .start_cp = @intCast(cp_start),
+                    .end_cp = @intCast(scan_cp),
+                }) catch return;
+            }
+        }
+    }
+
+    fn freeRows(rows: *Rows, alloc: Allocator) void {
+        var it = rows.iterator();
+        while (it.next()) |entry| {
+            alloc.free(entry.key_ptr.*);
+            alloc.free(entry.value_ptr.*);
+        }
+        rows.clearRetainingCapacity();
+    }
+};
 
 const testing = std.testing;
 
@@ -962,10 +1096,146 @@ test "a11y text: regex links dedup against OSC 8 ranges" {
     // `var`: oniguruma's `search` takes a mutable `*Regex`.
     var cfgs = [_]struct { regex: oni.Regex }{.{ .regex = re }};
 
-    matchRegexLinks(buffer.written(), &cfgs, &sink);
+    var cache: RegexLinkCache = .{};
+    defer cache.deinit(alloc);
+    cache.apply(alloc, buffer.written(), &cfgs, &sink);
 
     // The OSC 8 range survives; only the trailing bare URL is added.
     try testing.expectEqual(2, sink.links.items.len);
     try testing.expectEqual(20, sink.links.items[1].start_cp);
     try testing.expectEqualStrings("https://ghostty.org", sink.links.items[1].uri);
+}
+
+/// A pattern that finds `needle` and counts how often it is run, standing
+/// in for an `oni.Regex` in `RegexLinkCache` tests.
+const CountingRegex = struct {
+    needle: []const u8,
+    searches: usize = 0,
+
+    const Region = struct {
+        start: [1]c_int,
+        end: [1]c_int,
+
+        fn starts(self: *const Region) []const c_int {
+            return &self.start;
+        }
+
+        fn ends(self: *const Region) []const c_int {
+            return &self.end;
+        }
+
+        fn deinit(_: *Region) void {}
+    };
+
+    fn search(self: *CountingRegex, s: []const u8, _: anytype) error{ Mismatch, Failed }!Region {
+        self.searches += 1;
+        const i = std.mem.indexOf(u8, s, self.needle) orelse return error.Mismatch;
+        return .{
+            .start = .{@intCast(i)},
+            .end = .{@intCast(i + self.needle.len)},
+        };
+    }
+};
+
+const CountingCfg = struct { regex: CountingRegex };
+
+/// Run `cache` over `text` into a fresh sink and return the link starts.
+fn applyStarts(
+    cache: *RegexLinkCache,
+    text: []const u8,
+    cfgs: []CountingCfg,
+    out: []usize,
+) !usize {
+    var sink: TestSink = .{ .alloc = testing.allocator };
+    defer sink.deinit();
+    cache.apply(testing.allocator, text, cfgs, &sink);
+    for (sink.links.items, 0..) |l, i| {
+        try testing.expectEqual(l.start_cp + 4, l.end_cp);
+        try testing.expectEqualStrings("link", l.uri);
+        out[i] = l.start_cp;
+    }
+    return sink.links.items.len;
+}
+
+test "a11y text: regex links are found per row, in codepoint offsets" {
+    const oni = @import("oniguruma");
+    const url = @import("../config/url.zig");
+
+    try oni.testing.ensureInit();
+
+    const alloc = testing.allocator;
+    var re = try oni.Regex.init(url.regex, .{}, oni.Encoding.utf8, oni.Syntax.default, null);
+    defer re.deinit();
+    var cfgs = [_]struct { regex: oni.Regex }{.{ .regex = re }};
+
+    var sink: TestSink = .{ .alloc = alloc };
+    defer sink.deinit();
+    var cache: RegexLinkCache = .{};
+    defer cache.deinit(alloc);
+
+    // "é" is two bytes and "€" three, one codepoint each.
+    cache.apply(alloc, "é https://a.org\n€€ https://b.org x", &cfgs, &sink);
+
+    try testing.expectEqual(2, sink.links.items.len);
+    try testing.expectEqual(2, sink.links.items[0].start_cp);
+    try testing.expectEqual(15, sink.links.items[0].end_cp);
+    try testing.expectEqualStrings("https://a.org", sink.links.items[0].uri);
+    // Row 1 starts after 15 codepoints and the `\n`.
+    try testing.expectEqual(16 + 3, sink.links.items[1].start_cp);
+    try testing.expectEqualStrings("https://b.org", sink.links.items[1].uri);
+}
+
+test "a11y text: regex links only rerun on rows that changed" {
+    var cfgs = [_]CountingCfg{.{ .regex = .{ .needle = "link" } }};
+    var cache: RegexLinkCache = .{};
+    defer cache.deinit(testing.allocator);
+    var starts: [4]usize = undefined;
+
+    // Every row ends in its hit, so each row searched is one search.
+    try testing.expectEqual(2, try applyStarts(&cache, "a link\nb link", &cfgs, &starts));
+    try testing.expectEqual(2, cfgs[0].regex.searches);
+    try testing.expectEqualSlices(usize, &.{ 2, 9 }, starts[0..2]);
+
+    // Unchanged: nothing runs, the same links come back.
+    cfgs[0].regex.searches = 0;
+    try testing.expectEqual(2, try applyStarts(&cache, "a link\nb link", &cfgs, &starts));
+    try testing.expectEqual(0, cfgs[0].regex.searches);
+    try testing.expectEqualSlices(usize, &.{ 2, 9 }, starts[0..2]);
+
+    // One row changed.
+    try testing.expectEqual(2, try applyStarts(&cache, "a link\nccc link", &cfgs, &starts));
+    try testing.expectEqual(1, cfgs[0].regex.searches);
+    try testing.expectEqualSlices(usize, &.{ 2, 11 }, starts[0..2]);
+
+    // Scrolled by a row: the surviving row is found by its text and gets
+    // its new offset.
+    cfgs[0].regex.searches = 0;
+    try testing.expectEqual(2, try applyStarts(&cache, "ccc link\nd link", &cfgs, &starts));
+    try testing.expectEqual(1, cfgs[0].regex.searches);
+    try testing.expectEqualSlices(usize, &.{ 4, 11 }, starts[0..2]);
+
+    // A row repeated within one refresh is matched once.
+    cfgs[0].regex.searches = 0;
+    try testing.expectEqual(3, try applyStarts(&cache, "e link\ne link\ne link", &cfgs, &starts));
+    try testing.expectEqual(1, cfgs[0].regex.searches);
+    try testing.expectEqualSlices(usize, &.{ 2, 9, 16 }, starts[0..3]);
+
+    // Rows that left the viewport were dropped, not kept forever.
+    try testing.expectEqual(1, cache.rows.count());
+}
+
+test "a11y text: regex link cache starts over when the patterns change" {
+    var cfgs_a = [_]CountingCfg{.{ .regex = .{ .needle = "link" } }};
+    var cfgs_b = [_]CountingCfg{.{ .regex = .{ .needle = "link" } }};
+    var cache: RegexLinkCache = .{};
+    defer cache.deinit(testing.allocator);
+    var starts: [1]usize = undefined;
+
+    _ = try applyStarts(&cache, "a link", &cfgs_a, &starts);
+    _ = try applyStarts(&cache, "a link", &cfgs_b, &starts);
+    try testing.expectEqual(1, cfgs_b[0].regex.searches);
+
+    // No patterns at all: nothing matches and nothing stale survives.
+    _ = try applyStarts(&cache, "a link", cfgs_b[0..0], &starts);
+    try testing.expectEqual(0, cache.rows.count());
 }

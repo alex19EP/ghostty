@@ -45,8 +45,10 @@ widths: std.Io.Writer.Allocating,
 /// The ranges the rebuild modes collect, mirroring the surface's links
 /// and style runs.
 sink: Sink,
-/// Compiled link patterns. Only `regex` mode has any.
+/// Compiled link patterns. Only the regex modes have any.
 links: []LinkConfig,
+/// Regex matches per row, mirroring `regex_links` on the surface.
+regex_links: a11y.text.RegexLinkCache = .{},
 
 pub const Options = struct {
     /// The type of snapshot work to perform.
@@ -90,13 +92,19 @@ pub const Mode = enum {
     /// `text` with OSC 8 link tracking during the cell walk.
     links,
 
-    /// `links`, then the configured link regexes over the built text.
-    /// This is a changed frame on a current GTK with a default config.
+    /// `links`, then the configured link regexes over the built text,
+    /// with every row's matches thrown away first. This is a changed frame
+    /// on a current GTK with a default config in which every row changed.
     regex,
+
+    /// `regex` with the per-row match cache kept from the previous
+    /// iteration, so no row changed and no pattern runs: the floor a
+    /// frame pays when only a few rows did.
+    regex_cached,
 };
 
-/// A stand-in for `Surface`'s derived link config. `matchRegexLinks`
-/// only requires a `regex` field.
+/// A stand-in for `Surface`'s derived link config.
+/// `RegexLinkCache.apply` only requires a `regex` field.
 const LinkConfig = struct {
     regex: oni.Regex,
 };
@@ -174,10 +182,10 @@ pub fn create(
     const ptr = try alloc.create(A11yText);
     errdefer alloc.destroy(ptr);
 
-    // Only the regex mode needs compiled patterns. `global.init` has
+    // Only the regex modes need compiled patterns. `global.init` has
     // already initialized oniguruma by the time we get here.
     const links: []LinkConfig = links: {
-        if (opts.mode != .regex) break :links &.{};
+        if (opts.mode != .regex and opts.mode != .regex_cached) break :links &.{};
         const buf = try alloc.alloc(LinkConfig, 1);
         errdefer alloc.free(buf);
         buf[0] = .{ .regex = try oni.Regex.init(
@@ -212,6 +220,7 @@ pub fn create(
 }
 
 pub fn destroy(self: *A11yText, alloc: Allocator) void {
+    self.regex_links.deinit(alloc);
     for (self.links) |*link| link.regex.deinit();
     if (self.links.len > 0) alloc.free(self.links);
     self.sink.deinit();
@@ -230,6 +239,7 @@ pub fn benchmark(self: *A11yText) Benchmark {
             .text => stepText,
             .links => stepLinks,
             .regex => stepRegex,
+            .regex_cached => stepRegexCached,
         },
         .setupFn = setup,
     });
@@ -349,16 +359,29 @@ fn stepProbe(ptr: *anyopaque) Benchmark.Error!void {
 }
 
 fn stepText(ptr: *anyopaque) Benchmark.Error!void {
-    return stepBuild(ptr, false, false);
+    return stepBuild(ptr, false, .none);
 }
 
 fn stepLinks(ptr: *anyopaque) Benchmark.Error!void {
-    return stepBuild(ptr, true, false);
+    return stepBuild(ptr, true, .none);
 }
 
 fn stepRegex(ptr: *anyopaque) Benchmark.Error!void {
-    return stepBuild(ptr, true, true);
+    return stepBuild(ptr, true, .cold);
 }
+
+fn stepRegexCached(ptr: *anyopaque) Benchmark.Error!void {
+    return stepBuild(ptr, true, .warm);
+}
+
+/// Whether a rebuild runs the link regexes, and with what cached.
+const RegexPass = enum {
+    none,
+    /// No row's matches known: every row changed.
+    cold,
+    /// The previous iteration's matches kept: no row changed.
+    warm,
+};
 
 /// Mirrors what `A11y.refreshCache` does on a frame that changed: a fresh
 /// buffer, the viewport walk with widths and ranges recorded, the
@@ -367,7 +390,7 @@ fn stepRegex(ptr: *anyopaque) Benchmark.Error!void {
 fn stepBuild(
     ptr: *anyopaque,
     comptime track_links: bool,
-    comptime match_regex: bool,
+    comptime regex_pass: RegexPass,
 ) Benchmark.Error!void {
     const self: *A11yText = @ptrCast(@alignCast(ptr));
 
@@ -390,11 +413,18 @@ fn stepBuild(
             return error.BenchmarkFailed;
         };
 
-        if (match_regex) a11y.text.matchRegexLinks(
-            buffer.written(),
-            self.links,
-            &self.sink,
-        );
+        switch (regex_pass) {
+            .none => {},
+            .cold, .warm => {
+                if (regex_pass == .cold) self.regex_links.deinit(self.alloc);
+                self.regex_links.apply(
+                    self.alloc,
+                    buffer.written(),
+                    self.links,
+                    &self.sink,
+                );
+            },
+        }
 
         const text = self.alloc.dupeSentinel(u8, buffer.written(), 0) catch |err| {
             log.warn("error duplicating a11y text err={}", .{err});
