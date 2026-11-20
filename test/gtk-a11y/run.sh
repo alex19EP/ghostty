@@ -168,6 +168,10 @@ export DISPLAY=":$display_num"
 # surface's `present` signal, so the tests need real frames. Xvfb has no GPU.
 export LIBGL_ALWAYS_SOFTWARE=1
 export GDK_BACKEND=x11
+# GTK's GL renderer on X11 makes a GLX context current on the main
+# thread, and since Mesa 26.3 the renderer's EGL context then fails to
+# become current there (EGL_BAD_ACCESS). Cairo keeps GTK off GL.
+export GSK_RENDERER=cairo
 export GTK_A11Y=atspi
 
 # Opt-in gate read by conftest.py, so a bare `pytest` at the repo root

@@ -320,6 +320,9 @@ class Session:
                 # frames: change events hang off its `present` signal.
                 "LIBGL_ALWAYS_SOFTWARE": "1",
                 "GDK_BACKEND": "x11",
+                # GTK's GLX context blocks the renderer's EGL context from
+                # becoming current (Mesa 26.3+); see run.sh.
+                "GSK_RENDERER": "cairo",
             }
         )
         env.update(self.extra_env)
