@@ -27,56 +27,41 @@ const Surface = @import("surface.zig").Surface;
 
 const log = std.log.scoped(.gtk_ghostty_surface_a11y);
 
-/// Viewport text served to AT reads. Served until a rendered frame
-/// marks it stale, so offsets stay consistent across a multi-call read.
-cached_text: ?[:0]const u8 = null,
+/// The snapshot AT clients read and the baseline for the next event.
+/// Hidden surfaces update it on demand without sending events.
+cache: a11y.text.Snapshot = .{},
 
-/// Columns occupied by each codepoint of `cached_text`, filled by the
-/// same walk that builds it. Read through `cellWidths`.
-cached_widths: std.ArrayList(u8) = .empty,
+/// False until the first read.
+cached: bool = false,
 
-/// Caret offset in codepoints within `cached_text`.
-cached_cursor_offset: c_uint = 0,
+/// The next snapshot is built here and swapped into `cache`.
+scratch: a11y.text.Snapshot = .{},
 
-/// Latched on the first AT query, never cleared: GTK has no "the last
-/// AT client went away" signal. Gates the per-frame change probe.
+/// Set on the first AT read and never cleared, since GTK does not tell
+/// us when clients go away. Frames are only checked while set.
 active: bool = false,
 
-/// Viewport text at the last change notification. Change events are
-/// diffed against this so clients see minimal insert/remove ranges
-/// rather than a whole-viewport replacement on every keystroke.
-last_snapshot: ?[:0]const u8 = null,
-
-/// Caret offset at the last caret notification.
-last_notified_caret: c_uint = 0,
-
-/// The selection at the last selection notification, in codepoints of
-/// the text it was notified against. Null when there was none.
-last_selection: ?Range = null,
-
-/// Raw viewport bounds of the selection seen by the last probe: the
-/// probe's edge detector, kept apart from `last_selection` so an
-/// unchanged frame never converts offsets.
-last_sel_raw: ?SelRaw = null,
-
-/// Whether caret mode was on at the last probe. Regex links are only
-/// exposed in caret mode, so toggling it changes the links while the
-/// text, caret and selection can all stay the same.
-last_caret_mode: bool = false,
-
-/// Set on every rendered frame; cleared when the cache is confirmed
-/// to still match the viewport.
+/// A frame could not be checked, so the next read rebuilds the cache.
 cache_stale: bool = false,
 
-/// Retained scratch for `probeChanged` so the per-frame probe does
-/// not allocate once it has grown to viewport size.
-probe_buf: std.ArrayList(u8) = .empty,
+check_source: ?c_uint = null,
 
-/// Non-default style runs over `cached_text`, rebuilt with it. Gaps
+/// Prevents synchronous reads during notifications from rebuilding the cache.
+emitting: bool = false,
+
+/// When the oldest frame GTK has not painted yet was pushed, in
+/// `glib.getMonotonicTime` microseconds.
+unpainted_since: ?i64 = null,
+
+/// The current selection in viewport cells and whether caret mode is active.
+selection: ?SelRaw = null,
+caret_mode: bool = false,
+
+/// Non-default style runs over the cached text, rebuilt with it. Gaps
 /// between runs are default-styled.
 style_runs: std.ArrayList(StyleRun) = .empty,
 
-/// Links in `cached_text`, rebuilt with it. Only populated when
+/// Links in the cached text, rebuilt with it. Only populated when
 /// `a11y_hypertext.available` (GTK >= 4.22). Each owns its URI and,
 /// once a client has asked for it, a strong reference on its hyperlink
 /// object.
@@ -112,6 +97,9 @@ links_prev_frozen: bool = false,
 /// Created on first use.
 link_sentinel: ?*a11y_hypertext.AccessibleHyperlink = null,
 
+/// A pushed frame pending this long indicates GTK has stopped painting.
+const unpainted_after_us = 250 * std.time.us_per_ms;
+
 /// A half-open codepoint range.
 pub const Range = struct {
     start: c_uint,
@@ -144,6 +132,7 @@ const SelRaw = struct {
 };
 
 pub fn deinit(self: *A11y, alloc: Allocator) void {
+    if (self.check_source) |id| _ = glib.Source.remove(id);
     // `links_prev` is empty outside a refresh, but drain it anyway in case
     // a refresh was interrupted.
     clearLinks(&self.links, alloc);
@@ -153,24 +142,50 @@ pub fn deinit(self: *A11y, alloc: Allocator) void {
     if (self.link_sentinel) |s| unparentAndUnref(s);
     self.regex_links.deinit(alloc);
     self.style_runs.deinit(alloc);
-    self.probe_buf.deinit(alloc);
-    self.cached_widths.deinit(alloc);
-    if (self.cached_text) |v| alloc.free(v);
-    if (self.last_snapshot) |v| alloc.free(v);
+    self.cache.deinit(alloc);
+    self.scratch.deinit(alloc);
     self.* = .{};
 }
 
-/// Called by the surface after every rendered frame: mark the cache
-/// stale and, if an AT client has ever queried us, emit change events.
+/// Called from GTK's paint after each frame. Schedules a check for
+/// changes to send to AT clients. Frames painted before it runs share
+/// one check.
 ///
-/// Narrower gates than `active` are wrong: focus would silence
-/// unfocused splits, and `org.a11y.Status.IsEnabled` is a hint ATs
-/// write, not proof one is listening. The latch costs one probe per
-/// rendered frame (4.0us at 30x80, 12.6us at 60x200, per
-/// `ghostty-bench +a11y-text --mode=probe`); idle surfaces pay nothing.
+/// The check runs on every surface, not just the focused one, so that
+/// output in other splits is announced too.
 pub fn frameRendered(self: *A11y, surface: *Surface) void {
-    self.cache_stale = true;
-    if (self.active) self.notifyIfChanged(surface);
+    self.unpainted_since = null;
+    if (!self.active or self.check_source != null) return;
+
+    // The same priority as D-Bus, so a busy bus does not delay it.
+    self.check_source = glib.idleAddFull(
+        glib.PRIORITY_DEFAULT,
+        checkFrame,
+        surface,
+        null,
+    );
+}
+
+/// Called when the renderer pushes a frame. GTK can stop painting a
+/// window without unmapping it, for example an X11 window unmapped by
+/// the window manager. Frames that are pushed but not painted show that.
+pub fn framePushed(self: *A11y) void {
+    if (self.unpainted_since == null) self.unpainted_since = glib.getMonotonicTime();
+}
+
+/// Whether GTK paints our frames, so every change gets checked.
+fn painted(self: *const A11y, surface: *Surface) bool {
+    if (!surface.isPainted()) return false;
+    const since = self.unpainted_since orelse return true;
+    return glib.getMonotonicTime() - since < unpainted_after_us;
+}
+
+fn checkFrame(ud: ?*anyopaque) callconv(.c) c_int {
+    const surface: *Surface = @ptrCast(@alignCast(ud orelse return 0));
+    const self = surface.a11y();
+    self.check_source = null;
+    if (self.cached and self.painted(surface)) _ = self.updateSnapshot(surface, true);
+    return 0;
 }
 
 //---------------------------------------------------------------
@@ -180,22 +195,16 @@ pub fn frameRendered(self: *A11y, surface: *Surface) void {
 /// Slots left alone keep GTK's `default_init` implementations, which
 /// decline gracefully.
 pub fn initAccessibleTextInterface(iface: *gtk.AccessibleTextInterface) callconv(.c) void {
-    // Present since 4.14, which is the oldest GTK we run against.
     iface.f_get_contents = &getContents;
     iface.f_get_contents_at = &getContentsAt;
     iface.f_get_caret_position = &getCaretPosition;
     iface.f_get_selection = &getSelection;
     iface.f_get_attributes = &getAttributes;
     iface.f_get_default_attributes = &getDefaultAttributes;
+    iface.f_get_extents = &getExtents;
+    iface.f_get_offset = &getOffset;
 
-    // Later slots exist in our bindings, but `G_DEFINE_INTERFACE`
-    // allocates the vtable at the *running* GTK's size, so on an older
-    // runtime writing them would scribble past the allocation. Gate on the
-    // runtime version, not the bindings.
-    if (gtk_version.runtimeAtLeast(4, 16, 0)) {
-        iface.f_get_extents = &getExtents;
-        iface.f_get_offset = &getOffset;
-    }
+    // Only install later slots when the runtime vtable has room for them.
     if (gtk_version.runtimeAtLeast(4, 22, 0)) {
         iface.f_set_caret_position = &setCaretPosition;
         iface.f_set_selection = &setSelection;
@@ -300,145 +309,99 @@ fn getOffset(
     return 1;
 }
 
-/// Cell widths for the current `cached_text`, for converting between
-/// codepoint offsets and grid positions. Only meaningful after
-/// `refreshCache` has returned text; empty reads as one column per
-/// codepoint.
-fn cellWidths(self: *A11y) a11y.offsets.CellWidths {
-    return .{ .per_cp = self.cached_widths.items };
+fn cellWidths(self: *const A11y) a11y.offsets.CellWidths {
+    return self.cache.cellWidths();
 }
 
-/// Return the cached viewport text, rebuilding it first if a rendered
-/// frame marked it stale. Deliberately not a TTL: that could refresh
-/// mid-read, shifting offsets under the client. The text is one visual
-/// row per `\n`-delimited line, including blank rows, so every row has
-/// a range flat review can point at.
-fn refreshCache(self: *A11y, surface: *Surface) ?[:0]const u8 {
-    // Mark that an AT client is actively querying us.
+/// A hidden surface can keep receiving terminal output between reads.
+fn refreshCache(self: *A11y, surface: *Surface) ?[]const u8 {
     self.active = true;
-
-    // A frame rendered since this cache was built and nothing has
-    // since confirmed it still matches, so drop it. On a focused
-    // surface `notifyIfChanged` normally clears the mark first; this
-    // path keeps an unfocused surface's on-demand reads fresh.
-    const alloc = Application.default().allocator();
-    if (self.cache_stale) {
-        if (self.cached_text) |old| {
-            alloc.free(old);
-            self.cached_text = null;
-        }
-        self.cache_stale = false;
+    if (self.emitting) return self.cache.text.items;
+    if (!self.cached or self.cache_stale or
+        (self.check_source == null and !self.painted(surface)))
+    {
+        if (!self.updateSnapshot(surface, false)) return null;
     }
+    return self.cache.text.items;
+}
 
-    if (self.cached_text != null) return self.cached_text;
+/// Build once under the renderer lock. Collect styles and OSC 8 links
+/// from its pins only when replacing the cache. Regex matching and GTK
+/// object operations run after releasing the lock.
+fn updateSnapshot(self: *A11y, surface: *Surface, notify: bool) bool {
+    const core_surface = surface.core() orelse return false;
+    const alloc = Application.default().allocator();
+    const track_links = a11y_hypertext.available;
+    var sink: Sink = .{ .a11y = self, .alloc = alloc };
+    defer sink.deinit();
 
-    const core_surface = surface.core() orelse return null;
+    const selection, const caret_mode = snapshot: {
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+        const screen = core_surface.renderer_state.terminal.screens.active;
 
-    // Move the previous refresh's links aside for `Sink.commitLink` to
-    // reuse. The defer disposes whatever wasn't reused on every exit
-    // path, so an early return can't leak them or trip the asserts on
-    // the next refresh.
+        a11y.text.build(alloc, &self.scratch, screen) catch |err| {
+            log.warn("ax text build failed: {}", .{err});
+            self.cache_stale = true;
+            return false;
+        };
+        self.cache_stale = false;
+
+        const selection = selectionRaw(screen);
+        if (self.cached and self.cache.eql(&self.scratch) and
+            std.meta.eql(self.selection, selection) and self.caret_mode == screen.caret_mode)
+        {
+            return true;
+        }
+
+        self.style_runs.clearRetainingCapacity();
+        a11y.text.collectRanges(&self.scratch, &sink, track_links);
+        break :snapshot .{ selection, screen.caret_mode };
+    };
+
+    self.emitting = true;
+    defer self.emitting = false;
+
     assert(self.links_prev.items.len == 0);
     assert(self.links_prev_consumed == 0);
     assert(!self.links_prev_frozen);
     self.links_prev = self.links;
     self.links = .empty;
-    defer self.finalizeLinksPrev(alloc);
-    self.style_runs.clearRetainingCapacity();
 
-    // Widths are rebuilt in lockstep with the text below; `build` only
-    // appends, so the retained list must start empty to stay aligned
-    // with the fresh text. The writer takes over the list's memory and
-    // the defer hands it back on every exit path.
-    self.cached_widths.clearRetainingCapacity();
-    var widths: std.Io.Writer.Allocating = .fromArrayList(alloc, &self.cached_widths);
-    defer self.cached_widths = widths.toArrayList();
-
-    var buffer: std.Io.Writer.Allocating = .init(alloc);
-    defer buffer.deinit();
-
-    // Without the Hypertext interface nothing can read links, so don't
-    // look them up.
-    const track_links = a11y_hypertext.available;
-    var sink: Sink = .{ .a11y = self, .surface = surface, .alloc = alloc };
-    defer sink.deinit();
-
-    // The renderer mutex covers only the walk; everything after this
-    // point reads `buffer`, which is our own memory.
-    var caret_mode = false;
-    const result = result: {
-        core_surface.renderer_state.mutex.lockUncancelable(global.io());
-        defer core_surface.renderer_state.mutex.unlock(global.io());
-
-        const screen: *terminal.Screen =
-            core_surface.renderer_state.terminal.screens.active;
-        caret_mode = screen.caret_mode;
-
-        break :result a11y.text.buildWithSink(
-            &buffer.writer,
-            screen,
-            &sink,
-            .{
-                .track_links = track_links,
-                .widths = &widths.writer,
-            },
-        ) catch |err| {
-            log.warn("ax text build failed: {}", .{err});
-            return null;
-        };
-    };
-
-    // Configured regex links, after the walk so they dedup against the
-    // OSC 8 links it committed. Deliberately outside the renderer mutex:
-    // this touches only `buffer` and the `oni.Regex` objects in the
-    // derived config, which the mutex never protected anyway, because
-    // `Surface.changeConfig` swaps the config without taking it. What
-    // keeps them alive is that the swap and this run on the same (main)
-    // thread. Holding the lock here would cost the IO thread ~10x the
-    // walk itself on a large viewport for no safety benefit.
-    //
-    // Only in caret mode, the screen reader's counterpart of the Ctrl
-    // hover that shows these links to a sighted user: the regexes are
-    // the expensive part of a refresh, and output that replaces the whole
-    // viewport every frame would pay for them every frame. OSC 8 links
-    // cost nothing extra and are always exposed. Activation doesn't
-    // depend on this either way: `open_link` finds the link itself.
+    // Like Ctrl-hover, the regex pass is on demand. OSC 8 links are
+    // collected in every mode.
     if (track_links and caret_mode) self.regex_links.apply(
         alloc,
-        buffer.written(),
+        self.scratch.text.items,
         core_surface.config.links,
         &sink,
     );
     sink.finishLinks();
+    self.finalizeLinksPrev(alloc);
 
-    const text = alloc.dupeSentinel(u8, buffer.written(), 0) catch return null;
-    self.cached_text = text;
+    const old_selection = self.selectionRange(self.selection);
+    self.selection = selection;
+    self.caret_mode = caret_mode;
+    self.cached = true;
+    std.mem.swap(a11y.text.Snapshot, &self.cache, &self.scratch);
 
-    // AT-SPI wants the caret in codepoints; the walk reports a byte
-    // position. A cursor row outside the viewport has no byte offset
-    // and anchors at end-of-text.
-    const cursor_byte = @min(result.cursor_byte orelse text.len, text.len);
-    self.cached_cursor_offset = @intCast(utf8CpCount(text[0..cursor_byte]));
-
-    // The first text a client reads is the baseline change events are
-    // diffed against. Without one, the next frame would diff against ""
-    // and report the whole viewport, which the client already has, as
-    // newly inserted.
-    if (self.last_snapshot == null) {
-        self.last_snapshot = alloc.dupeSentinel(u8, text, 0) catch null;
-        self.last_notified_caret = self.cached_cursor_offset;
+    if (notify) {
+        const accessible = surface.as(gtk.AccessibleText);
+        self.emitTextDiff(surface, self.scratch.text.items, self.cache.text.items);
+        if (self.cache.caret != self.scratch.caret) {
+            gtk.AccessibleText.updateCaretPosition(accessible);
+        }
+        if (!std.meta.eql(old_selection, self.selectionRange(selection))) {
+            gtk.AccessibleText.updateSelectionBound(accessible);
+        }
     }
-
-    return self.cached_text;
+    return true;
 }
 
-/// The sink `a11y.text.buildWithSink` and `RegexLinkCache.apply` report into
-/// during a `refreshCache`. The walk half runs under the renderer mutex,
-/// so it must not do anything that can call back into us; see
-/// `commitLink`.
+/// Collect style ranges and stage hyperlinks for adoption outside the
+/// renderer lock.
 const Sink = struct {
     a11y: *A11y,
-    surface: *Surface,
     alloc: Allocator,
 
     /// Links found so far, in discovery order: the walk's OSC 8 runs,
@@ -600,71 +563,6 @@ fn finalizeLinksPrev(self: *A11y, alloc: Allocator) void {
     self.links_prev_frozen = false;
 }
 
-/// Cheap per-frame check for "could anything an AT client cares about
-/// have changed?": build only the text into the retained scratch
-/// buffer and compare it, the caret and the raw selection bounds against
-/// the last notification.
-/// Conservative: may answer true on a frame the full path then finds
-/// nothing to emit for, never false when something moved.
-fn probeChanged(self: *A11y, surface: *Surface) bool {
-    const core_surface = surface.core() orelse return false;
-
-    // No baseline means recording it failed in `refreshCache`; take
-    // the full path, which retries.
-    const old_text: []const u8 = self.last_snapshot orelse return true;
-
-    const alloc = Application.default().allocator();
-
-    // The writer takes over the retained scratch buffer's memory and
-    // the defer hands it back on every exit path, so the capacity it
-    // grew survives for the next frame's probe.
-    self.probe_buf.clearRetainingCapacity();
-    var probe: std.Io.Writer.Allocating = .fromArrayList(alloc, &self.probe_buf);
-    defer self.probe_buf = probe.toArrayList();
-
-    var sel_raw: ?SelRaw = null;
-    var caret_mode = false;
-    const result = result: {
-        core_surface.renderer_state.mutex.lockUncancelable(global.io());
-        defer core_surface.renderer_state.mutex.unlock(global.io());
-
-        const screen: *terminal.Screen =
-            core_surface.renderer_state.terminal.screens.active;
-
-        sel_raw = selectionRaw(screen);
-        caret_mode = screen.caret_mode;
-
-        break :result a11y.text.build(
-            &probe.writer,
-            screen,
-            .{},
-        ) catch |err| {
-            // Probing failed; fall back to the full path rather than
-            // risk swallowing a change.
-            log.warn("ax probe build failed: {}", .{err});
-            return true;
-        };
-    };
-
-    // Edge-detect the selection: record this frame's reading whatever
-    // we return, so a change is reported exactly once.
-    const selection_moved = !std.meta.eql(self.last_sel_raw, sel_raw);
-    self.last_sel_raw = sel_raw;
-    // Same for caret mode, which decides whether regex links are exposed.
-    const caret_mode_toggled = caret_mode != self.last_caret_mode;
-    self.last_caret_mode = caret_mode;
-
-    const text = probe.written();
-    if (!std.mem.eql(u8, old_text, text)) return true;
-    if (selection_moved or caret_mode_toggled) return true;
-
-    // Text is identical, so the caret's byte offset converts against
-    // the same bytes the cache was built from.
-    const cursor_byte = @min(result.cursor_byte orelse text.len, text.len);
-    const caret_cp: c_uint = @intCast(utf8CpCount(text[0..cursor_byte]));
-    return caret_cp != self.last_notified_caret;
-}
-
 /// The selection's bounds in viewport cells, or null if there is none
 /// or either end is outside the viewport. Caller holds the renderer
 /// mutex.
@@ -675,110 +573,23 @@ fn selectionRaw(screen: *terminal.Screen) ?SelRaw {
     return .{ .tl = tl.viewport, .br = br.viewport };
 }
 
-/// The terminal selection as a codepoint range of `text`, which must be
-/// the current `cached_text`. Null when there is no selection or it
-/// can't be represented: the snapshot is viewport-only, so a selection
-/// with an end in the scrollback has no offsets to report.
-fn selectionRange(self: *A11y, surface: *Surface, text: []const u8) ?Range {
-    const core_surface = surface.core() orelse return null;
-    const raw = raw: {
-        core_surface.renderer_state.mutex.lockUncancelable(global.io());
-        defer core_surface.renderer_state.mutex.unlock(global.io());
-        break :raw selectionRaw(core_surface.renderer_state.terminal.screens.active);
-    } orelse return null;
-
+/// Map a selection in viewport cells to the cached text.
+fn selectionRange(self: *const A11y, selection: ?SelRaw) ?Range {
+    const raw = selection orelse return null;
+    const text = self.cache.text.items;
     const widths = self.cellWidths();
-    const start = a11y.offsets.rowColToCp(text, widths, raw.tl.y, raw.tl.x) orelse
-        return null;
-    // The selection's end cell is inclusive; the range is not.
-    const end = (a11y.offsets.rowColToCp(text, widths, raw.br.y, raw.br.x) orelse
-        return null) + 1;
+    const start = a11y.offsets.rowColToCp(text, widths, raw.tl.y, raw.tl.x) orelse return null;
+    const end = (a11y.offsets.rowColToCp(text, widths, raw.br.y, raw.br.x) orelse return null) + 1;
     if (end <= start) return null;
     return .{ .start = @intCast(start), .end = @intCast(end) };
 }
 
-/// Emit AT-SPI change events if the viewport text, caret or selection
-/// moved since the last notification. We diff against the last notified
-/// snapshot and emit the smallest remove/insert pair: firing
-/// unconditionally would make an AT client restart reading on every
-/// rendered frame, and Orca's terminal script classifies events by
-/// `any_data` length, so a one-character insert reads as typing echo,
-/// not command output.
-fn notifyIfChanged(self: *A11y, surface: *Surface) void {
-    const alloc = Application.default().allocator();
-
-    // On an unchanged frame the cache still describes the viewport:
-    // retract this frame's staleness mark rather than making the next
-    // AT read pay for a rebuild.
-    if (!self.probeChanged(surface)) {
-        self.cache_stale = false;
-        return;
-    }
-
-    // Drop the cache so `refreshCache` rebuilds from the live
-    // viewport; the cache is the sole source of truth for AT reads.
-    if (self.cached_text) |old| {
-        alloc.free(old);
-        self.cached_text = null;
-    }
-    const new_text = self.refreshCache(surface) orelse return;
-    const old_text: []const u8 = self.last_snapshot orelse "";
-
-    const text_changed = !std.mem.eql(u8, old_text, new_text);
-    const caret_changed = self.cached_cursor_offset != self.last_notified_caret;
-    const selection = self.selectionRange(surface, new_text);
-    const selection_changed = !std.meta.eql(selection, self.last_selection);
-
-    if (!text_changed and !caret_changed and !selection_changed) return;
-
-    const accessible = surface.as(gtk.AccessibleText);
-    if (text_changed) {
-        self.emitTextDiff(surface, old_text, new_text);
-
-        // Keep our own copy rather than aliasing `cached_text`: the
-        // cache is freed and rewritten on every refresh.
-        if (self.last_snapshot) |prev| alloc.free(prev);
-        self.last_snapshot = alloc.dupeSentinel(u8, new_text, 0) catch null;
-    }
-    if (caret_changed) {
-        self.last_notified_caret = self.cached_cursor_offset;
-        gtk.AccessibleText.updateCaretPosition(accessible);
-    }
-    if (selection_changed) {
-        self.last_selection = selection;
-        gtk.AccessibleText.updateSelectionBound(accessible);
-    }
-}
-
-/// Cache state displaced by `aliasOldSnapshot`.
-const AliasedCache = struct {
-    text: ?[:0]const u8,
-    cursor: c_uint,
-    widths: std.ArrayList(u8),
-};
-
-/// Point the cache at the pre-change snapshot for the duration of a
-/// `.remove` emit: GTK's bridge fills `any_data` by calling back into
-/// `getContents` synchronously, and for a remove the client expects
-/// the *deleted* substring, which the cache no longer holds. The
-/// displaced widths go empty (one column per codepoint); nothing
-/// inside the emit can rebuild the cache behind our back.
-fn aliasOldSnapshot(self: *A11y) AliasedCache {
-    const saved: AliasedCache = .{
-        .text = self.cached_text,
-        .cursor = self.cached_cursor_offset,
-        .widths = self.cached_widths,
-    };
-    self.cached_text = self.last_snapshot;
-    self.cached_cursor_offset = self.last_notified_caret;
-    self.cached_widths = .empty;
-    return saved;
-}
-
-fn restoreCache(self: *A11y, saved: AliasedCache) void {
-    self.cached_text = saved.text;
-    self.cached_cursor_offset = saved.cursor;
-    self.cached_widths = saved.widths;
+/// GTK reads the removed text synchronously, so expose the old snapshot
+/// for the duration of the removal.
+fn emitRemoval(self: *A11y, accessible: *gtk.AccessibleText, start: c_uint, end: c_uint) void {
+    std.mem.swap(a11y.text.Snapshot, &self.cache, &self.scratch);
+    defer std.mem.swap(a11y.text.Snapshot, &self.cache, &self.scratch);
+    gtk.AccessibleText.updateContents(accessible, .remove, start, end);
 }
 
 /// Prefix/suffix diff: bytes `[0..p)` and `[len-s..)` are unchanged,
@@ -817,11 +628,7 @@ fn emitShiftUp(
 
     // The bridge reads the deleted range back out of us synchronously,
     // so the cache must point at the pre-remove text for the call.
-    {
-        const saved = self.aliasOldSnapshot();
-        defer self.restoreCache(saved);
-        gtk.AccessibleText.updateContents(accessible, .remove, 0, removed_cp);
-    }
+    self.emitRemoval(accessible, 0, removed_cp);
 
     if (new_end_cp > tail_cp) {
         gtk.AccessibleText.updateContents(accessible, .insert, tail_cp, new_end_cp);
@@ -849,9 +656,7 @@ fn emitShiftDown(
     const inserted_cp: c_uint = @intCast(utf8CpCount(new_text[0..scroll_j]));
 
     if (old_end_cp > kept_cp) {
-        const saved = self.aliasOldSnapshot();
-        defer self.restoreCache(saved);
-        gtk.AccessibleText.updateContents(accessible, .remove, kept_cp, old_end_cp);
+        self.emitRemoval(accessible, kept_cp, old_end_cp);
     }
 
     gtk.AccessibleText.updateContents(accessible, .insert, 0, inserted_cp);
@@ -874,10 +679,8 @@ fn emitPrefixSuffix(
     const accessible = surface.as(gtk.AccessibleText);
     const start_cp: c_uint = @intCast(utf8CpCount(old_text[0..p]));
     if (removed_len != 0) {
-        const saved = self.aliasOldSnapshot();
-        defer self.restoreCache(saved);
         const end_cp: c_uint = @intCast(utf8CpCount(old_text[0..(old_text.len - s)]));
-        gtk.AccessibleText.updateContents(accessible, .remove, start_cp, end_cp);
+        self.emitRemoval(accessible, start_cp, end_cp);
     }
     if (inserted_len != 0) {
         const end_cp: c_uint = @intCast(utf8CpCount(new_text[0..(new_text.len - s)]));
@@ -982,7 +785,7 @@ fn getCaretPosition(
     const surface = gobject.ext.cast(Surface, accessible) orelse return 0;
     const self = surface.a11y();
     _ = self.refreshCache(surface);
-    return self.cached_cursor_offset;
+    return @intCast(self.cache.caret);
 }
 
 /// Move the caret to `offset` (GTK 4.22+). A terminal has no caret an
@@ -1041,8 +844,16 @@ fn getSelection(
     n_ranges.* = 0;
     const surface = gobject.ext.cast(Surface, accessible) orelse return 0;
     const self = surface.a11y();
-    const text = self.refreshCache(surface) orelse return 0;
-    const range = self.selectionRange(surface, text) orelse return 0;
+    _ = self.refreshCache(surface) orelse return 0;
+
+    // A client can read back its selection before the next frame.
+    const selection = if (self.emitting) self.selection else selection: {
+        const core_surface = surface.core() orelse return 0;
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
+        break :selection selectionRaw(core_surface.renderer_state.terminal.screens.active);
+    };
+    const range = self.selectionRange(selection) orelse return 0;
 
     // Transfer-container: the caller frees the array with `g_free`.
     if (out_ranges) |out| {

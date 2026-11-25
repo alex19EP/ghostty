@@ -6,16 +6,11 @@
 //! while holding `renderer_state.mutex`, so like `ScreenClone` this is
 //! a lock holder that directly impacts IO throughput.
 //!
-//! The modes that matter mirror the real per-frame paths: `probe` is
-//! `A11y.probeChanged`, which every rendered frame pays, and `text`,
-//! `links` and `regex` are `A11y.refreshCache` on progressively newer GTK,
-//! which only a frame that actually changed pays.
+//! `probe` measures a snapshot and comparison. The other modes measure
+//! the work of a changed snapshot, with optional OSC 8 and regex links.
 //!
-//! What this does NOT measure: constructing the `GtkAccessibleHyperlink`
-//! GObjects the real sink creates per link, or the AT-SPI D-Bus traffic
-//! that follows a change. Those need a live GTK app and bus, so the
-//! numbers here are a floor on the real per-frame cost, not the whole of
-//! it.
+//! Hyperlink GObject construction and AT-SPI traffic require a live GTK
+//! app and bus and are outside the scope of this benchmark.
 const A11yText = @This();
 
 const std = @import("std");
@@ -35,13 +30,9 @@ const log = std.log.scoped(.@"a11y-text-bench");
 opts: Options,
 alloc: Allocator,
 terminal: Terminal,
-/// Retained scratch + reference snapshot for `probe` mode, mirroring
-/// `probe_buf` and `last_snapshot` on the GTK surface a11y state.
-probe_buf: std.Io.Writer.Allocating,
-probe_snapshot: std.Io.Writer.Allocating,
-/// Per-codepoint cell widths, mirroring `cached_widths`. Only the
-/// rebuild modes fill this, because only `A11y.refreshCache` asks for it.
-widths: std.Io.Writer.Allocating,
+/// Retained buffers for the current and previous viewport snapshots.
+scratch: a11y.text.Snapshot = .{},
+previous: a11y.text.Snapshot = .{},
 /// The ranges the rebuild modes collect, mirroring the surface's links
 /// and style runs.
 sink: Sink,
@@ -76,20 +67,13 @@ pub const Mode = enum {
     /// anything. Isolates iteration overhead from the snapshot work.
     noop,
 
-    /// The per-frame change probe: text into a retained scratch buffer,
-    /// then a memcmp against the previous snapshot. No allocation, no
-    /// widths, no ranges. This is what an *unchanged* frame costs once
-    /// the change gate is in place, and it is the number that matters
-    /// most, because most frames don't change.
+    /// Build a snapshot and compare it with the previous one.
     probe,
 
-    /// The full rebuild without link tracking: the walk with cell widths
-    /// and style runs recorded, plus the NUL-terminated dup that gets
-    /// cached. This is what a changed frame costs on GTK older than
-    /// 4.22, where the Hypertext interface isn't available.
+    /// Build a snapshot and collect text styles.
     text,
 
-    /// `text` with OSC 8 link tracking during the cell walk.
+    /// Collect both text styles and OSC 8 links.
     links,
 
     /// `links`, then the configured link regexes over the built text,
@@ -209,9 +193,6 @@ pub fn create(
             .rows = opts.@"terminal-rows",
             .cols = opts.@"terminal-cols",
         }),
-        .probe_buf = .init(alloc),
-        .probe_snapshot = .init(alloc),
-        .widths = .init(alloc),
         .sink = .{ .alloc = alloc },
         .links = links,
     };
@@ -224,9 +205,8 @@ pub fn destroy(self: *A11yText, alloc: Allocator) void {
     for (self.links) |*link| link.regex.deinit();
     if (self.links.len > 0) alloc.free(self.links);
     self.sink.deinit();
-    self.probe_buf.deinit();
-    self.probe_snapshot.deinit();
-    self.widths.deinit();
+    self.scratch.deinit(alloc);
+    self.previous.deinit(alloc);
     self.terminal.deinit(alloc);
     alloc.destroy(self);
 }
@@ -295,11 +275,10 @@ fn setup(ptr: *anyopaque) Benchmark.Error!void {
 
     // Reference snapshot for `probe` mode, built out here so the timed
     // loop measures only the probe itself.
-    self.probe_snapshot.clearRetainingCapacity();
-    _ = a11y.text.build(
-        &self.probe_snapshot.writer,
+    a11y.text.build(
+        self.alloc,
+        &self.previous,
         self.terminal.screens.active,
-        .{},
     ) catch |err| {
         log.warn("error building probe snapshot err={}", .{err});
         return error.BenchmarkFailed;
@@ -329,32 +308,13 @@ fn stepNoop(ptr: *anyopaque) Benchmark.Error!void {
     }
 }
 
-/// Models `A11y.probeChanged`: retained scratch buffer, text only, then the
-/// memcmp against the last notified snapshot. This is the gate that lets
-/// an unchanged frame skip the rebuild entirely.
+/// Measures the snapshot work for a frame whose text did not change.
 fn stepProbe(ptr: *anyopaque) Benchmark.Error!void {
     const self: *A11yText = @ptrCast(@alignCast(ptr));
 
     for (0..iterations(self)) |_| {
-        self.probe_buf.clearRetainingCapacity();
-
-        const result = a11y.text.build(
-            &self.probe_buf.writer,
-            self.terminal.screens.active,
-            .{},
-        ) catch |err| {
-            log.warn("error probing a11y text err={}", .{err});
-            return error.BenchmarkFailed;
-        };
-
-        const changed = !std.mem.eql(
-            u8,
-            self.probe_snapshot.written(),
-            self.probe_buf.written(),
-        );
-
-        std.mem.doNotOptimizeAway(changed);
-        std.mem.doNotOptimizeAway(result.cp_count);
+        try self.buildSnapshot();
+        std.mem.doNotOptimizeAway(self.scratch.eql(&self.previous));
     }
 }
 
@@ -383,10 +343,18 @@ const RegexPass = enum {
     warm,
 };
 
-/// Mirrors what `A11y.refreshCache` does on a frame that changed: a fresh
-/// buffer, the viewport walk with widths and ranges recorded, the
-/// optional regex pass, and the final NUL-terminated dup that gets
-/// cached. The allocation churn is intentional: the real path pays it too.
+fn buildSnapshot(self: *A11yText) Benchmark.Error!void {
+    a11y.text.build(
+        self.alloc,
+        &self.scratch,
+        self.terminal.screens.active,
+    ) catch |err| {
+        log.warn("error building a11y text err={}", .{err});
+        return error.BenchmarkFailed;
+    };
+}
+
+/// Measures a changed frame, including its ranges and optional regex pass.
 fn stepBuild(
     ptr: *anyopaque,
     comptime track_links: bool,
@@ -395,23 +363,9 @@ fn stepBuild(
     const self: *A11yText = @ptrCast(@alignCast(ptr));
 
     for (0..iterations(self)) |_| {
-        var buffer: std.Io.Writer.Allocating = .init(self.alloc);
-        defer buffer.deinit();
-        self.widths.clearRetainingCapacity();
         self.sink.reset();
-
-        const result = a11y.text.buildWithSink(
-            &buffer.writer,
-            self.terminal.screens.active,
-            &self.sink,
-            .{
-                .track_links = track_links,
-                .widths = &self.widths.writer,
-            },
-        ) catch |err| {
-            log.warn("error building a11y text err={}", .{err});
-            return error.BenchmarkFailed;
-        };
+        try self.buildSnapshot();
+        a11y.text.collectRanges(&self.scratch, &self.sink, track_links);
 
         switch (regex_pass) {
             .none => {},
@@ -419,22 +373,15 @@ fn stepBuild(
                 if (regex_pass == .cold) self.regex_links.deinit(self.alloc);
                 self.regex_links.apply(
                     self.alloc,
-                    buffer.written(),
+                    self.scratch.text.items,
                     self.links,
                     &self.sink,
                 );
             },
         }
 
-        const text = self.alloc.dupeSentinel(u8, buffer.written(), 0) catch |err| {
-            log.warn("error duplicating a11y text err={}", .{err});
-            return error.BenchmarkFailed;
-        };
-        defer self.alloc.free(text);
-
-        std.mem.doNotOptimizeAway(result.cp_count);
-        std.mem.doNotOptimizeAway(text.len);
-        std.mem.doNotOptimizeAway(self.widths.written().len);
+        std.mem.doNotOptimizeAway(self.scratch.text.items.len);
+        std.mem.doNotOptimizeAway(self.scratch.widths.items.len);
         std.mem.doNotOptimizeAway(self.sink.links.items.len);
         std.mem.doNotOptimizeAway(self.sink.style_runs.items.len);
     }
